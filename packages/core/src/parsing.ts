@@ -10,6 +10,7 @@ import {
   findVersionByChecksum, setVersionStatus, setAssetStatus,
 } from './db.ts';
 import { classifyAssetContent } from './content-classify.ts';
+import { chunkStandardDocument, type StandardChunk, type StandardSourceMethod } from './standard-chunker.ts';
 
 const pexec = promisify(execFile);
 
@@ -84,6 +85,21 @@ function diagramNodeText(n: any): string {
 }
 
 export type BuiltChunk = { text: string; chunkType: string; sourceMethod: string };
+
+export function buildStandardChunksForIngest(
+  slides: Array<{ text?: string }>,
+  opts: { title?: string; format: string; sourceMethod?: StandardSourceMethod }
+): StandardChunk[] {
+  if (!['pdf', 'docx'].includes(opts.format)) return [];
+  const text = slides.map((slide) => String(slide.text || '').trim()).filter(Boolean).join('\n');
+  if (!text.trim()) return [];
+  const chunks = chunkStandardDocument({
+    text,
+    title: opts.title,
+    sourceMethod: opts.sourceMethod || 'native',
+  });
+  return chunks.length >= 2 ? chunks : [];
+}
 
 /** 把一页的 VLM 理解(vj) + 解析产物(slide) 归一成多类型 chunk（纯函数，便于测试）。
  * 类型：summary/raw/ocr_text/table_markdown/number_fact/diagram_node/speaker_notes。空值跳过。 */
@@ -180,6 +196,54 @@ export async function parseAndStore(
       progress: slides.length ? 30 : 70,
       totalPages: slides.length,
     });
+
+    const standardChunks = buildStandardChunksForIngest(slides, { title, format, sourceMethod: 'native' });
+    if (standardChunks.length) {
+      emit({
+        eventType: 'standard_chunking_started',
+        stage: 'chunking',
+        label: `已识别标准文档结构，正在生成 ${standardChunks.length} 个条款切片`,
+        progress: 72,
+        totalPages: slides.length,
+      });
+      standardChunks.forEach((chunk, index) => {
+        const unitId = createUnit({
+          versionId,
+          slideNo: index + 1,
+          imagePath: '',
+          rawText: chunk.text,
+          visualJson: JSON.stringify({ standardChunk: chunk }),
+          title: chunk.clauseTitle || chunk.chapterTitle || chunk.standardName,
+          slideType: chunk.chunkType,
+          conclusion: chunk.clauseNo,
+          visualSummary: chunk.hierarchy.join(' > '),
+          confidence: chunk.confidence,
+          needsReview: chunk.needsReview,
+        });
+        createChunk({
+          unitId,
+          text: chunk.text,
+          chunkType: chunk.chunkType,
+          sourceMethod: chunk.sourceMethod,
+          confidence: chunk.confidence,
+          needsReview: chunk.needsReview,
+          parentUnitId: unitId,
+        });
+      });
+      emit({ eventType: 'indexing_started', stage: 'indexing', label: '正在写入标准条款索引', progress: 92, totalPages: slides.length });
+      setVersionStatus(versionId, 'done', standardChunks.length);
+      setAssetStatus(assetId, 'published');
+      classifyAssetContent(assetId, title).catch(() => {});
+      emit({
+        eventType: 'done',
+        stage: 'done',
+        label: '标准条款入库完成',
+        progress: 100,
+        totalPages: slides.length,
+        payload: { chunks: standardChunks.length },
+      });
+      return { assetId, versionId, pages: slides.length };
+    }
 
     await pool(slides, concurrency, async (slide) => {
       let vj: any;

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, Copy, Loader2, PlayCircle, RefreshCw, Search, UploadCloud } from "lucide-react";
 import { useView } from "@/components/view-context";
 import { Badge } from "@/components/ui/badge";
@@ -14,9 +14,19 @@ import {
   INITIAL_SIGNALS,
   INTERFACE_SAMPLES,
   compareStandardText,
+  beginAgentExecutionRun,
+  buildAgentExecutionLog,
+  buildDraftValidationStatus,
+  isReadableDraftAttachment,
+  isServerParsedDraftAttachment,
+  isServerParsedKnowledgeAttachment,
+  normalizeParsedDraftText,
+  normalizeDraftAttachmentText,
   normalizeBulkSignalText,
+  runDocumentValidation,
   runSearchSimulation,
   sliceKnowledgeText,
+  type AgentExecutionLogLine,
   type Clause,
   type MatchResult,
   type SignalSample,
@@ -67,7 +77,15 @@ export default function ValidatorConsole() {
 
   const [draftText, setDraftText] = useState(DRAFT_SAMPLE);
   const [draftIssues, setDraftIssues] = useState<[string, string, string][]>(validateDraft(DRAFT_SAMPLE));
-  const [targetStandardText, setTargetStandardText] = useState(CLAUSE_SAMPLE);
+  const [draftSourceType, setDraftSourceType] = useState("自动识别");
+  const [draftFileName, setDraftFileName] = useState("样例标准草案.txt");
+  const [draftFileInputKey, setDraftFileInputKey] = useState(0);
+  const [draftFileStatus, setDraftFileStatus] = useState(buildDraftValidationStatus("样例标准草案.txt", validateDraft(DRAFT_SAMPLE).length));
+  const [agentTrace, setAgentTrace] = useState<AgentExecutionLogLine[]>([]);
+  const [agentTraceVisible, setAgentTraceVisible] = useState(true);
+  const [agentRunning, setAgentRunning] = useState(false);
+  const agentLogEndRef = useRef<HTMLDivElement | null>(null);
+  const agentRunId = useRef(0);
   const [currentMatch, setCurrentMatch] = useState<MatchResult | null>(null);
   const [comparisonCount, setComparisonCount] = useState(0);
   const [reportCount, setReportCount] = useState(0);
@@ -104,6 +122,26 @@ export default function ValidatorConsole() {
     setTimeout(() => setToast(""), 1600);
   };
 
+  useEffect(() => {
+    agentLogEndRef.current?.scrollIntoView({ block: "end" });
+  }, [agentTrace]);
+
+  const playAgentLog = async (lines: AgentExecutionLogLine[]) => {
+    const run = beginAgentExecutionRun(agentRunId.current);
+    const runId = run.runId;
+    agentRunId.current = run.currentRunId;
+    setAgentTraceVisible(true);
+    setAgentRunning(false);
+    setAgentTrace([]);
+    setAgentRunning(true);
+    for (const line of lines) {
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      if (agentRunId.current !== runId) return;
+      setAgentTrace((prev) => prev.concat(line));
+    }
+    if (agentRunId.current === runId) setAgentRunning(false);
+  };
+
   const filteredClauses = useMemo(
     () =>
       clauses.filter((clause) => {
@@ -120,7 +158,7 @@ export default function ValidatorConsole() {
   const sourceStats = useMemo(() => countBy(clauses, (item) => item.source), [clauses]);
   const signalStats = useMemo(() => countBy(signals, (item) => item.source), [signals]);
 
-  const effectiveMatch = currentMatch || compareStandardText(targetStandardText, clauses);
+  const effectiveMatch = currentMatch || compareStandardText(draftText || CLAUSE_SAMPLE, clauses);
   const reportText = `标准条款比对报告 · ${effectiveMatch.clause.id}
 
 待验证条款：
@@ -157,22 +195,94 @@ ${effectiveMatch.issues.join("；")}
     showToast(`已入库 ${pendingSlices.length} 个切片`);
   };
 
-  const onValidateDraft = () => {
-    setDraftIssues(validateDraft(draftText));
-    showToast("文本校验完成");
-  };
-
-  const onRunMatch = () => {
-    const text = targetStandardText.trim();
-    if (!text) {
-      showToast("请先输入待验证标准条款");
+  const onKnowledgeFileChange = async (file: File | undefined) => {
+    if (!file) return;
+    setPendingSlices([]);
+    if (isServerParsedKnowledgeAttachment(file.name)) {
+      setKbUploadStatus(`维护状态：正在解析 ${file.name}，请稍候。`);
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        const response = await fetch("/api/text/extract", { method: "POST", body: form });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "文档正文解析失败");
+        const text = normalizeParsedDraftText(String(data.text || ""));
+        if (!text) throw new Error("未提取到可切分的正文");
+        setKbRawText(text);
+        setKbUploadStatus(`维护状态：已解析 ${file.name} 正文，可执行自动切分。`);
+        showToast(`已解析 ${file.name}`);
+      } catch (error) {
+        setKbUploadStatus(`维护状态：${file.name} 解析失败。${String(error).replace(/^Error:\s*/, "")}`);
+        showToast("知识库文档解析失败");
+      }
       return;
     }
-    const match = compareStandardText(text, clauses);
-    setCurrentMatch(match);
+
+    const textLike = /\.(txt|md|markdown|html|htm|xml|json|csv)$/i.test(file.name);
+    if (!textLike) {
+      setKbUploadStatus(`维护状态：已选择 ${file.name}，当前支持 TXT/MD/HTML/XML/JSON/CSV/PDF/DOC/DOCX 自动读取。`);
+      return;
+    }
+    const text = normalizeDraftAttachmentText(await file.text(), file.name);
+    setKbRawText(text);
+    setKbUploadStatus(`维护状态：已读取 ${file.name}，可执行自动切分。`);
+  };
+
+  const onValidateDraft = () => {
+    const result = runDocumentValidation(draftText, clauses);
+    setDraftIssues(result.issues);
+    setCurrentMatch(result.match);
     setComparisonCount((v) => v + 1);
     setReportCount((v) => v + 1);
-    showToast("条款比对完成");
+    setDraftFileStatus(buildDraftValidationStatus(draftFileName || "粘贴文本", result.issues.length));
+    void playAgentLog(
+      buildAgentExecutionLog({
+        text: draftText,
+        sourceType: draftSourceType,
+        fileName: draftFileName || "粘贴文本",
+        issues: result.issues,
+        match: result.match,
+      })
+    );
+    showToast("文本验证完成");
+  };
+
+  const onDraftFileChange = async (file: File | undefined) => {
+    if (!file) return;
+    setDraftFileName(file.name);
+    agentRunId.current += 1;
+    setAgentRunning(false);
+    setAgentTrace([]);
+    if (isServerParsedDraftAttachment(file.name)) {
+      setDraftFileStatus(`文档状态：正在解析 ${file.name}，请稍候。`);
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        const response = await fetch("/api/text/extract", { method: "POST", body: form });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "Word 正文解析失败");
+        const text = normalizeParsedDraftText(String(data.text || ""));
+        setDraftText(text);
+        setDraftIssues([]);
+        setDraftFileStatus(`文档状态：已读取 ${file.name} 正文，可点击“开始验证”。`);
+        showToast(`已读取 ${file.name}`);
+      } catch (error) {
+        setDraftFileStatus(`文档状态：${file.name} 解析失败。${String(error).replace(/^Error:\s*/, "")}`);
+        showToast("Word 文件解析失败");
+      }
+      return;
+    }
+    if (!isReadableDraftAttachment(file.name)) {
+      setDraftFileStatus(`文档状态：已选择 ${file.name}。当前仅支持 TXT/MD/HTML/CSV/JSON/XML/LOG/DOC/DOCX，可先粘贴正文后开始验证。`);
+      showToast("当前附件格式暂不支持自动读取");
+      return;
+    }
+    const raw = await file.text();
+    const normalized = normalizeDraftAttachmentText(raw, file.name);
+    setDraftText(normalized);
+    setDraftIssues([]);
+    setDraftFileStatus(`文档状态：已读取 ${file.name}，可点击“开始验证”。`);
+    showToast(`已读取 ${file.name}`);
   };
 
   const appendSignal = (source: string, text: string, region = "杭州市", type = "接入样本") => {
@@ -258,13 +368,23 @@ ${effectiveMatch.issues.join("；")}
   };
 
   const onRunAll = () => {
-    if (!targetStandardText.trim()) setTargetStandardText(CLAUSE_SAMPLE);
-    setDraftIssues(validateDraft(draftText));
-    const match = compareStandardText(targetStandardText || CLAUSE_SAMPLE, clauses);
-    setCurrentMatch(match);
+    const result = runDocumentValidation(draftText || DRAFT_SAMPLE, clauses);
+    if (!draftText.trim()) setDraftText(DRAFT_SAMPLE);
+    setDraftIssues(result.issues);
+    setCurrentMatch(result.match);
+    setDraftFileStatus(buildDraftValidationStatus(draftFileName || "样例标准草案.txt", result.issues.length));
+    void playAgentLog(
+      buildAgentExecutionLog({
+        text: draftText || DRAFT_SAMPLE,
+        sourceType: draftSourceType,
+        fileName: draftFileName || "样例标准草案.txt",
+        issues: result.issues,
+        match: result.match,
+      })
+    );
     setComparisonCount((v) => v + 1);
     setReportCount((v) => v + 1);
-    navigate("matching");
+    navigate("check");
     showToast("全链路验证完成");
   };
 
@@ -276,7 +396,12 @@ ${effectiveMatch.issues.join("；")}
     setKbRawText("");
     setDraftText(DRAFT_SAMPLE);
     setDraftIssues(validateDraft(DRAFT_SAMPLE));
-    setTargetStandardText(CLAUSE_SAMPLE);
+    setDraftSourceType("自动识别");
+    setDraftFileName("样例标准草案.txt");
+    setDraftFileInputKey((v) => v + 1);
+    setDraftFileStatus(buildDraftValidationStatus("样例标准草案.txt", validateDraft(DRAFT_SAMPLE).length));
+    setAgentTrace([]);
+    setAgentTraceVisible(true);
     setCurrentMatch(null);
     setComparisonCount(0);
     setReportCount(0);
@@ -446,23 +571,12 @@ ${effectiveMatch.issues.join("；")}
                   <option key={item}>{item}</option>
                 ))}
               </select>
-              <Input placeholder="可上传文本文件或直接粘贴正文" readOnly />
+              <Input placeholder="可上传 PDF/Word/文本文件或直接粘贴正文" readOnly />
               <input
                 className="block h-9 w-full rounded-lg border border-border px-3 py-1 text-sm file:mr-3 file:rounded-md file:border-0 file:bg-muted file:px-3 file:py-1"
                 type="file"
                 accept=".txt,.md,.markdown,.html,.htm,.xml,.json,.csv,.doc,.docx,.pdf,.wps,.et,.dps"
-                onChange={async (e) => {
-                  const file = e.target.files?.[0];
-                  if (!file) return;
-                  const textLike = /\.(txt|md|markdown|html|htm|xml|json|csv)$/i.test(file.name.toLowerCase());
-                  if (!textLike) {
-                    setKbUploadStatus(`维护状态：已选择 ${file.name}，当前可粘贴正文模拟自动切分。`);
-                    return;
-                  }
-                  const text = await file.text();
-                  setKbRawText(text);
-                  setKbUploadStatus(`维护状态：已读取 ${file.name}，可执行自动切分。`);
-                }}
+                onChange={(e) => onKnowledgeFileChange(e.target.files?.[0])}
               />
             </div>
             <textarea className="min-h-28 w-full rounded-lg border border-border bg-background p-3 text-sm" value={kbRawText} onChange={(e) => setKbRawText(e.target.value)} />
@@ -570,29 +684,173 @@ ${effectiveMatch.issues.join("；")}
 
       {activeView === "check" && (
         <div className="grid gap-4 xl:grid-cols-2">
-          <Card className="space-y-2">
-            <h2 className="text-lg font-semibold">标准文本校验</h2>
-            <textarea className="min-h-[260px] w-full rounded-lg border border-border bg-background p-3 text-sm" value={draftText} onChange={(e) => setDraftText(e.target.value)} />
+          <Card className="space-y-3">
+            <div>
+              <h2 className="text-lg font-semibold">文本验证</h2>
+              <p className="mt-1 text-sm text-muted-foreground">上传标准草案文档后，自动提取正文并进行格式、术语、逻辑和可执行性检查。</p>
+            </div>
+            <div className="space-y-3 rounded-lg border border-border p-3">
+              <p className="text-sm text-muted-foreground">
+                支持 TXT、MD、HTML、CSV、JSON、XML、LOG、DOC、DOCX。PDF、WPS 可先提取正文后粘贴验证。
+              </p>
+              <div className="grid gap-2 lg:grid-cols-[1fr_1fr]">
+                <select
+                  className="h-9 rounded-lg border border-border bg-background px-3 text-sm"
+                  value={draftSourceType}
+                  onChange={(e) => setDraftSourceType(e.target.value)}
+                >
+                  {["自动识别", "标准草案", "办事指南", "政策条文", "调研材料"].map((item) => (
+                    <option key={item}>{item}</option>
+                  ))}
+                </select>
+                <input
+                  key={draftFileInputKey}
+                  className="block h-9 w-full rounded-lg border border-border px-3 py-1 text-sm file:mr-3 file:rounded-md file:border-0 file:bg-muted file:px-3 file:py-1"
+                  type="file"
+                  accept=".txt,.md,.markdown,.html,.htm,.xml,.json,.csv,.tsv,.log,.doc,.docx,.pdf,.wps"
+                  onChange={(e) => onDraftFileChange(e.target.files?.[0])}
+                />
+              </div>
+              <textarea
+                className="min-h-[220px] w-full rounded-lg border border-border bg-background p-3 text-sm"
+                placeholder="也可以直接粘贴标准草案正文，点击“开始验证”。"
+                value={draftText}
+                onChange={(e) => {
+                  setDraftText(e.target.value);
+                  if (!draftFileName) setDraftFileName("粘贴文本");
+                }}
+              />
+              <p className="rounded-md border border-border bg-slate-50 px-3 py-2 text-xs text-muted-foreground">{draftFileStatus}</p>
+            </div>
             <div className="flex flex-wrap gap-2">
-              <Button variant="outline" onClick={onValidateDraft}>校验文本</Button>
-              <Button variant="ghost" onClick={() => { setDraftText(DRAFT_SAMPLE); setDraftIssues(validateDraft(DRAFT_SAMPLE)); }}>载入样例草案</Button>
+              <Button variant="primary" onClick={onValidateDraft} disabled={agentRunning}>开始验证</Button>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  const issues = validateDraft(DRAFT_SAMPLE);
+                  setDraftText(DRAFT_SAMPLE);
+                  setDraftIssues(issues);
+                  setDraftFileName("样例标准草案.txt");
+                  setDraftFileStatus(buildDraftValidationStatus("样例标准草案.txt", issues.length));
+                  agentRunId.current += 1;
+                  setAgentRunning(false);
+                  setAgentTrace([]);
+                }}
+              >
+                载入样例文档
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setDraftText("");
+                  setDraftIssues([]);
+                  setDraftFileName("粘贴文本");
+                  setDraftFileInputKey((v) => v + 1);
+                  setDraftFileStatus("文档状态：待上传附件或粘贴标准草案正文。");
+                  agentRunId.current += 1;
+                  setAgentRunning(false);
+                  setAgentTrace([]);
+                }}
+              >
+                清空
+              </Button>
             </div>
           </Card>
           <Card className="space-y-2">
+            <div className="rounded-lg border border-slate-800 bg-slate-950 p-3 text-slate-100 shadow-inner">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-sm font-semibold">智能体执行窗口</h2>
+                  <p className="mt-1 text-xs text-slate-400">滚动日志 · 执行过程 · 推理摘要 · 判断依据</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Badge variant={agentRunning ? "warning" : agentTrace.length ? "success" : "warning"}>{agentRunning ? "执行中" : agentTrace.length ? "已完成" : "待执行"}</Badge>
+                  <button
+                    type="button"
+                    className="h-8 rounded-md border border-slate-700 px-3 text-xs text-slate-200 hover:bg-slate-800"
+                    onClick={() => setAgentTraceVisible((value) => !value)}
+                  >
+                    {agentTraceVisible ? "收起" : "展开"}
+                  </button>
+                </div>
+              </div>
+              {agentTraceVisible && (
+                <div className="mt-3 h-[360px] overflow-y-auto rounded-md border border-slate-800 bg-black/30 p-3 font-mono text-[12px] leading-5">
+                  {agentTrace.length ? (
+                    <div className="space-y-2">
+                      {agentTrace.map((line, index) => (
+                        <div key={`${line.time}-${line.phase}-${index}`} className="grid gap-2 border-b border-slate-900/80 pb-2 last:border-b-0 md:grid-cols-[72px_86px_1fr]">
+                          <span className="text-slate-500">{line.time}</span>
+                          <span
+                            className={`w-fit rounded px-1.5 py-0.5 text-[10px] uppercase ${
+                              line.kind === "system"
+                                ? "bg-cyan-500/15 text-cyan-200"
+                                : line.kind === "action"
+                                  ? "bg-blue-500/15 text-blue-200"
+                                  : line.kind === "reasoning"
+                                    ? "bg-amber-500/15 text-amber-200"
+                                    : line.kind === "evidence"
+                                      ? "bg-violet-500/15 text-violet-200"
+                                      : "bg-emerald-500/15 text-emerald-200"
+                            }`}
+                          >
+                            {({ system: "系统", action: "执行", reasoning: "推理", evidence: "证据", result: "结果" } as const)[line.kind]}
+                          </span>
+                          <p className="break-words text-slate-300">
+                            <span className="mr-2 text-slate-500">[{line.phase}]</span>
+                            {line.message}
+                          </p>
+                        </div>
+                      ))}
+                      <div ref={agentLogEndRef} />
+                    </div>
+                  ) : (
+                    <div className="text-xs text-slate-400">点击“开始验证”后，滚动展示完整执行过程、推理摘要、判断依据和输出结果。</div>
+                  )}
+                </div>
+              )}
+            </div>
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold">校验结果</h2>
               <Badge variant={issueCount > 2 ? "danger" : issueCount > 0 ? "warning" : "success"}>{issueCount} 项</Badge>
             </div>
             <div className="space-y-2">
-              {draftIssues.map(([level, title, detail], index) => (
-                <div key={index} className="rounded-md border border-border p-3 text-sm">
-                  <div className="mb-1 flex items-center gap-2 font-medium">
-                    <Badge variant={level === "高" ? "danger" : level === "中" ? "warning" : "info"}>{level}</Badge>
-                    {title}
+              {draftIssues.length ? (
+                draftIssues.map(([level, title, detail], index) => (
+                  <div key={index} className="rounded-md border border-border p-3 text-sm">
+                    <div className="mb-1 flex items-center gap-2 font-medium">
+                      <Badge variant={level === "高" ? "danger" : level === "中" ? "warning" : "info"}>{level}</Badge>
+                      {title}
+                    </div>
+                    <p className="text-muted-foreground">{detail}</p>
                   </div>
-                  <p className="text-muted-foreground">{detail}</p>
+                ))
+              ) : (
+                <div className="rounded-md border border-border p-3 text-sm text-muted-foreground">上传或粘贴正文后，点击“开始验证”查看问题清单和条款比对结果。</div>
+              )}
+            </div>
+            <div className="space-y-3 border-t border-border pt-3">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold">比对结论</h2>
+                <Badge variant={confidenceVariant(currentMatch?.score)}>{currentMatch ? `${currentMatch.score} 分` : "待验证"}</Badge>
+              </div>
+              {!currentMatch ? (
+                <div className="rounded-md border border-border p-3 text-sm text-muted-foreground">开始验证后，系统会自动匹配知识库中最相似的标准条款。</div>
+              ) : (
+                <div className="space-y-2 text-sm">
+                  <div className="rounded-md border border-border p-3"><b>数据库最相似条款：</b>{currentMatch.clause.id} {currentMatch.clause.text}</div>
+                  <div className="rounded-md border border-border p-3"><b>相似命中：</b>{currentMatch.overlap.length ? currentMatch.overlap.join("、") : "无明显关键词命中"}（相似度 {currentMatch.similarity}%）</div>
+                  <div className="rounded-md border border-border p-3">
+                    <b>差异与风险：</b>
+                    <ul className="ml-5 list-disc">
+                      {currentMatch.issues.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="rounded-md border border-border p-3"><b>比对结论：</b>{currentMatch.conclusion}</div>
                 </div>
-              ))}
+              )}
             </div>
           </Card>
         </div>
@@ -698,42 +956,6 @@ ${effectiveMatch.issues.join("；")}
               </div>
               <p className="text-xs text-muted-foreground">{interfaceStatus}</p>
             </div>
-          </Card>
-        </div>
-      )}
-
-      {activeView === "matching" && (
-        <div className="grid gap-4 xl:grid-cols-2">
-          <Card className="space-y-2">
-            <h2 className="text-lg font-semibold">输入待验证标准条款</h2>
-            <textarea className="min-h-[260px] w-full rounded-lg border border-border bg-background p-3 text-sm" value={targetStandardText} onChange={(e) => setTargetStandardText(e.target.value)} />
-            <div className="flex flex-wrap gap-2">
-              <Button variant="outline" onClick={onRunMatch}>运行条款比对</Button>
-              <Button variant="ghost" onClick={() => { setTargetStandardText(CLAUSE_SAMPLE); setCurrentMatch(null); showToast("已载入待验证条款样例"); }}>载入待验证条款样例</Button>
-            </div>
-          </Card>
-          <Card className="space-y-3">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold">比对结论</h2>
-              <Badge variant={confidenceVariant(currentMatch?.score)}>{currentMatch ? `${currentMatch.score} 分` : "待验证"}</Badge>
-            </div>
-            {!currentMatch ? (
-              <div className="rounded-md border border-border p-3 text-sm text-muted-foreground">请输入待验证标准条款，点击“运行条款比对”。</div>
-            ) : (
-              <div className="space-y-2 text-sm">
-                <div className="rounded-md border border-border p-3"><b>数据库最相似条款：</b>{currentMatch.clause.id} {currentMatch.clause.text}</div>
-                <div className="rounded-md border border-border p-3"><b>相似命中：</b>{currentMatch.overlap.length ? currentMatch.overlap.join("、") : "无明显关键词命中"}（相似度 {currentMatch.similarity}%）</div>
-                <div className="rounded-md border border-border p-3">
-                  <b>差异与风险：</b>
-                  <ul className="ml-5 list-disc">
-                    {currentMatch.issues.map((item) => (
-                      <li key={item}>{item}</li>
-                    ))}
-                  </ul>
-                </div>
-                <div className="rounded-md border border-border p-3"><b>比对结论：</b>{currentMatch.conclusion}</div>
-              </div>
-            )}
           </Card>
         </div>
       )}

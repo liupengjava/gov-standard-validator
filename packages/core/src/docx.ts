@@ -10,6 +10,7 @@ import { ROOT, PYTHON, STORAGE_RAW, STORAGE_DERIVED, MODEL_PARSE, PARSE_CONCURRE
 import { analyzeSlide } from './ai-cli.ts';
 import { buildChunks } from './parsing.ts';
 import { splitSections } from './feishu.ts';
+import { chunkStandardDocument } from './standard-chunker.ts';
 import {
   createAsset, createVersion, createUnit, createChunk,
   findVersionByChecksum, setVersionStatus, setAssetStatus,
@@ -63,13 +64,42 @@ export async function ingestDocxDoc(docxPath: string, opts: DocxIngestOpts = {})
     const data = await parseDocx(docxPath, derived);
     if (!data.ok) throw new Error('parse_docx failed: ' + (data.error || ''));
 
-    // 1) 文字段（doc chunk，直接入库、不 VLM）
-    const secs = splitSections(data.markdown || '');
-    secs.forEach((s, i) => {
-      const unitId = createUnit({ versionId, slideNo: i + 1, imagePath: '', rawText: s.text, visualJson: '{}', title: s.heading || (null as any), slideType: 'section' });
-      const text = (s.heading ? s.heading + '。' : '') + s.text;
-      if (text.trim()) createChunk({ unitId, text, chunkType: 'doc' });
-    });
+    // 1) 文字段：标准文档优先按条款入库，识别不到标准结构再按普通 section 入库。
+    const standardChunks = chunkStandardDocument({ text: data.markdown || '', title, sourceMethod: 'native' });
+    const useStandardChunks = standardChunks.length >= 2;
+    const secs = useStandardChunks ? [] : splitSections(data.markdown || '');
+    if (useStandardChunks) {
+      standardChunks.forEach((chunk, i) => {
+        const unitId = createUnit({
+          versionId,
+          slideNo: i + 1,
+          imagePath: '',
+          rawText: chunk.text,
+          visualJson: JSON.stringify({ standardChunk: chunk }),
+          title: chunk.clauseTitle || chunk.chapterTitle || chunk.standardName,
+          slideType: chunk.chunkType,
+          conclusion: chunk.clauseNo,
+          visualSummary: chunk.hierarchy.join(' > '),
+          confidence: chunk.confidence,
+          needsReview: chunk.needsReview,
+        });
+        createChunk({
+          unitId,
+          text: chunk.text,
+          chunkType: chunk.chunkType,
+          sourceMethod: chunk.sourceMethod,
+          confidence: chunk.confidence,
+          needsReview: chunk.needsReview,
+          parentUnitId: unitId,
+        });
+      });
+    } else {
+      secs.forEach((s, i) => {
+        const unitId = createUnit({ versionId, slideNo: i + 1, imagePath: '', rawText: s.text, visualJson: '{}', title: s.heading || (null as any), slideType: 'section' });
+        const text = (s.heading ? s.heading + '。' : '') + s.text;
+        if (text.trim()) createChunk({ unitId, text, chunkType: 'doc' });
+      });
+    }
 
     // 2) 嵌入图 VLM（image 单元，slide_no 从 1000 起，区别于文字段）
     const imgs: string[] = withImages && Array.isArray(data.images) ? data.images : [];
@@ -91,9 +121,9 @@ export async function ingestDocxDoc(docxPath: string, opts: DocxIngestOpts = {})
       opts.onProgress?.(done, imgs.length);
     });
 
-    setVersionStatus(versionId, 'done', secs.length);
+    setVersionStatus(versionId, 'done', useStandardChunks ? standardChunks.length : secs.length);
     setAssetStatus(assetId, 'published');
-    return { assetId, versionId, sections: secs.length, images: imgs.length };
+    return { assetId, versionId, sections: useStandardChunks ? standardChunks.length : secs.length, images: imgs.length };
   } catch (e) {
     setVersionStatus(versionId, 'failed', undefined, String(e));
     setAssetStatus(assetId, 'failed');

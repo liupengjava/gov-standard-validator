@@ -3,3 +3,4 @@ packages:
   - "packages/*"
 allowBuilds:
   sharp: true
+  tesseract.js: set this to true or false

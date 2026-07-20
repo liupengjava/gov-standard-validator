@@ -1,18 +1,18 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { LayoutDashboard, Library, CheckCheck, DatabaseZap, GitCompareArrows, FileText } from "lucide-react";
+import { LayoutDashboard, Library, CheckCheck, DatabaseZap, FileText } from "lucide-react";
 import { Sidebar, SidebarContent, SidebarFooter, SidebarHeader, SidebarMenuButton } from "@/components/ui/sidebar";
 import { ViewContext, type AppView } from "@/components/view-context";
+import { NAV_ITEMS, type NavIconName } from "@/lib/navigation";
 
-const NAV_ITEMS: { view: AppView; title: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { view: "overview", title: "总览驾驶舱", icon: LayoutDashboard },
-  { view: "knowledge", title: "标准知识库", icon: Library },
-  { view: "check", title: "文本校验", icon: CheckCheck },
-  { view: "signals", title: "舆情与调研", icon: DatabaseZap },
-  { view: "matching", title: "比对验证", icon: GitCompareArrows },
-  { view: "report", title: "报告输出", icon: FileText },
-];
+const NAV_ICONS: Record<NavIconName, React.ComponentType<{ className?: string }>> = {
+  LayoutDashboard,
+  Library,
+  CheckCheck,
+  DatabaseZap,
+  FileText,
+};
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const [activeView, setActiveView] = useState<AppView>("overview");
@@ -38,9 +38,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </SidebarHeader>
           <SidebarContent>
             {NAV_ITEMS.map((item) => {
-              const Icon = item.icon;
+              const Icon = NAV_ICONS[item.icon];
               return (
-                <SidebarMenuButton key={item.view} active={activeView === item.view} onClick={() => setActiveView(item.view)}>
+                <SidebarMenuButton key={item.view} active={activeView === item.view} onClick={() => setActiveView(item.view as AppView)}>
                   <Icon className="h-[18px] w-[18px]" />
                   {item.title}
                 </SidebarMenuButton>

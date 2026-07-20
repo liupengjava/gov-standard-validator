@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { tableToMarkdown, buildChunks } from './parsing.ts';
+import { tableToMarkdown, buildChunks, buildStandardChunksForIngest } from './parsing.ts';
 
 test('tableToMarkdown 生成表头 + 分隔行 + 数据行', () => {
   const md = tableToMarkdown([['指标', '数值'], ['接通率', '95%']]);
@@ -70,4 +70,32 @@ test('buildChunks 兼容旧版 architecture_nodes 纯字符串 / numbers desc', 
   );
   assert.match(chunks.find((c) => c.chunkType === 'diagram_node')!.text, /节点：号码识别/);
   assert.match(chunks.find((c) => c.chunkType === 'number_fact')!.text, /指标：日呼量/);
+});
+
+test('buildStandardChunksForIngest 为标准 PDF/DOCX 生成条款切片且不处理 PPT', () => {
+  const slides = [
+    {
+      slide_no: 1,
+      text: `GB/T 32168-2015
+政务服务中心网上服务规范
+1 范围
+本标准规定了网上服务要求。
+4 服务渠道
+4.1 一次性告知
+材料不齐全的，应一次性告知申请人需要补正的全部内容。`,
+    },
+  ];
+
+  const pdfChunks = buildStandardChunksForIngest(slides, {
+    title: 'GB/T 32168-2015 政务服务中心网上服务规范',
+    format: 'pdf',
+  });
+  const pptChunks = buildStandardChunksForIngest(slides, {
+    title: 'GB/T 32168-2015 政务服务中心网上服务规范',
+    format: 'ppt',
+  });
+
+  assert.ok(pdfChunks.some((chunk) => chunk.clauseNo === '4.1'));
+  assert.equal(pdfChunks.some((chunk) => /\.{5,}/.test(chunk.text)), false);
+  assert.deepEqual(pptChunks, []);
 });

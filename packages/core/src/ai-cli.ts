@@ -3,6 +3,7 @@ import { readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { resolveCodexCommand } from './codex-bin.ts';
 
 export type ClaudeResult = { text: string; raw: any };
 
@@ -133,7 +134,8 @@ function runCodexOnce(prompt: string, imagePath: string, model: string | undefin
       '--skip-git-repo-check', '--ephemeral', '--dangerously-bypass-approvals-and-sandbox'];
     if (model) args.push('-m', model);
     args.push(prompt);
-    const ch = spawn('codex', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const cmd = resolveCodexCommand(args);
+    const ch = spawn(cmd.command, cmd.args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let err = '';
     const to = setTimeout(() => { ch.kill('SIGKILL'); reject(new Error('codex timeout')); }, timeoutMs);
     ch.stdout.on('data', () => {}); // 忽略进度输出
@@ -166,7 +168,8 @@ function runCodexTextOnce(prompt: string, model: string, timeoutMs: number): Pro
       '-c', `model_providers.indata.requires_openai_auth=false`,
       '-c', `disable_response_storage=true`,
       prompt];
-    const ch = spawn('codex', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const cmd = resolveCodexCommand(args);
+    const ch = spawn(cmd.command, cmd.args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let err = '';
     const to = setTimeout(() => { ch.kill('SIGKILL'); reject(new Error('codex timeout')); }, timeoutMs);
     ch.stdout.on('data', () => {});

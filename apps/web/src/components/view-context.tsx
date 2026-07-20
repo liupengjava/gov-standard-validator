@@ -2,7 +2,7 @@
 
 import { createContext, useContext } from "react";
 
-export type AppView = "overview" | "knowledge" | "check" | "signals" | "matching" | "report";
+export type AppView = "overview" | "knowledge" | "check" | "signals" | "report";
 
 export type ViewContextType = {
   activeView: AppView;

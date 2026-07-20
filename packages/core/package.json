@@ -9,6 +9,7 @@
     "./parsing": "./src/parsing.ts",
     "./retrieval": "./src/retrieval.ts",
     "./ai-cli": "./src/ai-cli.ts",
+    "./standard-chunker": "./src/standard-chunker.ts",
     "./vector-index": "./src/vector-index.ts"
   }
 }

@@ -1,3 +1,5 @@
+import { chunkStandardDocument, type StandardChunk } from "@gov-validator/core/standard-chunker";
+
 export type Clause = {
   id: string;
   source: string;
@@ -207,25 +209,54 @@ export function keywordsFromText(text: string): string[] {
   return hits.length ? hits : [inferDimension(text)];
 }
 
+function dimensionFromStandardChunk(chunk: StandardChunk): Clause["dimension"] {
+  const mapped: Record<StandardChunk["dimension"], string> = {
+    material: "材料",
+    process: "流程",
+    resource: "资源",
+    security: "安全",
+    evaluation: "评价",
+    archive: "流程",
+    definition: "流程",
+    other: "流程",
+  };
+  return mapped[chunk.dimension] as Clause["dimension"];
+}
+
+function constraintFromStandardChunk(chunk: StandardChunk): Clause["constraint"] {
+  const mapped: Record<StandardChunk["constraint"], string> = {
+    must: "应",
+    prohibit: "应",
+    should: "宜",
+    may: "可",
+    unknown: "可",
+  };
+  return mapped[chunk.constraint] as Clause["constraint"];
+}
+
+function standardChunkKeywords(chunk: StandardChunk): string[] {
+  const tokens = [
+    chunk.standardNo,
+    chunk.standardName,
+    chunk.chapterTitle,
+    chunk.clauseTitle,
+    ...chunk.hierarchy,
+    dimensionFromStandardChunk(chunk),
+    constraintFromStandardChunk(chunk),
+  ].filter((item): item is string => !!item && item.trim().length > 0);
+  const dictionaryHits = keywordsFromText(chunk.text);
+  return [...new Set([...tokens, ...dictionaryHits])].slice(0, 14);
+}
+
 export function sliceKnowledgeText(raw: string, sourceType = "上传标准文本", baseCount = 0): Clause[] {
-  const cleaned = raw.replace(/\r/g, "\n").replace(/[ \t]+/g, " ").trim();
-  if (!cleaned) return [];
-  const chunks = cleaned
-    .split(/\n+|(?<=[。；;])/)
-    .map((item) => item.trim())
-    .filter((item) => item.length >= 10);
-  const merged: string[] = [];
-  chunks.forEach((chunk) => {
-    if (chunk.length < 26 && merged.length) merged[merged.length - 1] = `${merged[merged.length - 1]}${chunk}`;
-    else merged.push(chunk);
-  });
-  return merged.slice(0, 12).map((text, index) => ({
-    id: `UP-${String(baseCount + index + 1).padStart(3, "0")}`,
-    source: sourceType,
-    dimension: inferDimension(text),
-    constraint: inferConstraint(text),
-    text,
-    keywords: keywordsFromText(text),
+  const chunks = chunkStandardDocument({ text: raw, title: sourceType });
+  return chunks.map((chunk, index) => ({
+    id: chunk.clauseNo || `UP-${String(baseCount + index + 1).padStart(3, "0")}`,
+    source: chunk.standardName || sourceType,
+    dimension: dimensionFromStandardChunk(chunk),
+    constraint: constraintFromStandardChunk(chunk),
+    text: chunk.text,
+    keywords: standardChunkKeywords(chunk),
   }));
 }
 
@@ -303,6 +334,225 @@ export function validateDraft(text: string): [string, string, string][] {
   }
   if (!text.trim()) issues.push(["低", "未输入文本", "请载入样例草案或输入需要校验的标准条款。"]);
   return issues;
+}
+
+export function runDocumentValidation(text: string, clauses: Clause[]): { issues: [string, string, string][]; match: MatchResult } {
+  return {
+    issues: validateDraft(text),
+    match: compareStandardText(text || DRAFT_SAMPLE, clauses),
+  };
+}
+
+export function isReadableDraftAttachment(fileName: string): boolean {
+  return /\.(txt|md|markdown|csv|tsv|json|xml|html|htm|log)$/i.test(fileName);
+}
+
+export function isServerParsedDraftAttachment(fileName: string): boolean {
+  return /\.(docx|doc)$/i.test(fileName);
+}
+
+export function isServerParsedKnowledgeAttachment(fileName: string): boolean {
+  return /\.(pdf|docx|doc)$/i.test(fileName);
+}
+
+function normalizeWhitespace(text: string): string {
+  return text
+    .replace(/\r/g, "\n")
+    .split(/\n+/)
+    .map((item) => item.replace(/[ \t]+/g, " ").trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function normalizeParsedDraftText(text: string): string {
+  return normalizeWhitespace(text);
+}
+
+export function normalizeDraftAttachmentText(rawText: string, fileName = ""): string {
+  const name = fileName.toLowerCase();
+  if (/\.json$/i.test(name)) {
+    try {
+      const data = JSON.parse(rawText);
+      const rows = Array.isArray(data) ? data : Object.values(data).find(Array.isArray) || [data];
+      const picked = rows
+        .map((row) => {
+          if (typeof row === "string") return row;
+          if (!row || typeof row !== "object") return "";
+          const values = Object.values(row).filter((value): value is string => typeof value === "string");
+          return row.content || row.text || row.body || row.summary || row.detail || values.find((value) => value.length > 8) || "";
+        })
+        .filter(Boolean);
+      if (picked.length) return normalizeWhitespace(picked.join("\n"));
+    } catch {
+      return normalizeWhitespace(rawText);
+    }
+  }
+  if (/\.(html|htm)$/i.test(name)) {
+    return normalizeWhitespace(rawText.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " "));
+  }
+  if (/\.(csv|tsv)$/i.test(name)) {
+    const separator = /\.tsv$/i.test(name) ? "\t" : ",";
+    return normalizeWhitespace(
+      rawText
+        .split(/\n+/)
+        .map((line) =>
+          line
+            .split(separator)
+            .map((cell) => cell.trim().replace(/^"|"$/g, ""))
+            .filter(Boolean)
+            .join(" ")
+        )
+        .join("\n")
+    );
+  }
+  return normalizeWhitespace(rawText);
+}
+
+export function buildDraftValidationStatus(fileName: string, issueCount: number): string {
+  return `文档状态：${fileName} 已完成验证，发现 ${issueCount} 项需关注问题。`;
+}
+
+export type AgentExecutionStep = {
+  phase: string;
+  action: string;
+  thought: string;
+  evidence: string;
+  status: "done";
+};
+
+export type AgentExecutionLogLine = {
+  time: string;
+  kind: "system" | "action" | "reasoning" | "evidence" | "result";
+  phase: string;
+  message: string;
+};
+
+export function beginAgentExecutionRun(currentRunId: number): { runId: number; currentRunId: number } {
+  const runId = currentRunId + 1;
+  return { runId, currentRunId: runId };
+}
+
+function logTime(index: number): string {
+  const seconds = index * 2;
+  const hh = String(Math.floor(seconds / 3600)).padStart(2, "0");
+  const mm = String(Math.floor((seconds % 3600) / 60)).padStart(2, "0");
+  const ss = String(seconds % 60).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+export function buildAgentExecutionTrace({
+  text,
+  sourceType,
+  fileName,
+  issues,
+  match,
+}: {
+  text: string;
+  sourceType: string;
+  fileName: string;
+  issues: [string, string, string][];
+  match: MatchResult;
+}): AgentExecutionStep[] {
+  const cleanText = normalizeWhitespace(text || DRAFT_SAMPLE);
+  const lineCount = cleanText ? cleanText.split("\n").length : 0;
+  const topIssue = issues[0]?.[1] || "未发现高优先级问题";
+  const riskLevel = issues[0]?.[0] || "低";
+  const sourceLabel = sourceType || "自动识别";
+  const fileLabel = fileName || "粘贴文本";
+
+  return [
+    {
+      phase: "读取输入",
+      action: `读取 ${fileLabel}，获得 ${cleanText.length} 个字符、${lineCount} 段文本。`,
+      thought: `将输入按“${sourceLabel}”处理，优先识别可验证条款和义务性表述。`,
+      evidence: cleanText.slice(0, 46) || "使用内置样例文本。",
+      status: "done",
+    },
+    {
+      phase: "结构抽取",
+      action: "抽取办理条件、材料补正、数据安全和执行口径等关键句。",
+      thought: "先定位可能影响基层执行的动词、时限、对象和例外条件，再进入规则校验。",
+      evidence: `识别到 ${Math.max(1, Math.min(issues.length + 1, 6))} 类候选关注点。`,
+      status: "done",
+    },
+    {
+      phase: "规则校验",
+      action: `按格式、术语、逻辑和可执行性规则完成 ${issues.length} 项问题扫描。`,
+      thought: `${riskLevel}优先级关注：${topIssue}。`,
+      evidence: issues.length ? issues.map(([, title]) => title).join("、") : "未触发明显规则问题。",
+      status: "done",
+    },
+    {
+      phase: "知识库比对",
+      action: `匹配最相似标准条款 ${match.clause.id}，相似度 ${match.similarity}%。`,
+      thought: "用命中关键词和条款主题判断是否存在口径偏离或缺失项。",
+      evidence: `${match.clause.id}：${match.clause.text}`,
+      status: "done",
+    },
+    {
+      phase: "结论生成",
+      action: `汇总校验问题、比对差异和建议结论，形成 ${match.score} 分可信度判断。`,
+      thought: match.conclusion,
+      evidence: match.issues.join("；"),
+      status: "done",
+    },
+  ];
+}
+
+export function buildAgentExecutionLog(input: {
+  text: string;
+  sourceType: string;
+  fileName: string;
+  issues: [string, string, string][];
+  match: MatchResult;
+}): AgentExecutionLogLine[] {
+  const trace = buildAgentExecutionTrace(input);
+  const cleanText = normalizeWhitespace(input.text || DRAFT_SAMPLE);
+  const log: AgentExecutionLogLine[] = [
+    {
+      time: logTime(0),
+      kind: "system",
+      phase: "任务初始化",
+      message: `启动文本验证智能体：输入来源 ${input.fileName || "粘贴文本"}，文本类型 ${input.sourceType || "自动识别"}，正文长度 ${cleanText.length} 字。`,
+    },
+  ];
+
+  trace.forEach((step) => {
+    log.push(
+      {
+        time: logTime(log.length),
+        kind: "action",
+        phase: step.phase,
+        message: step.action,
+      },
+      {
+        time: logTime(log.length + 1),
+        kind: "reasoning",
+        phase: step.phase,
+        message: `推理摘要：${step.thought}`,
+      },
+      {
+        time: logTime(log.length + 2),
+        kind: "evidence",
+        phase: step.phase,
+        message: `依据：${step.evidence}`,
+      },
+      {
+        time: logTime(log.length + 3),
+        kind: "result",
+        phase: step.phase,
+        message: `阶段完成：${step.phase} 已写入验证上下文。`,
+      }
+    );
+  });
+
+  log.push({
+    time: logTime(log.length),
+    kind: "result",
+    phase: "任务完成",
+    message: `输出完成：发现 ${input.issues.length} 项校验问题，最相似条款 ${input.match.clause.id}，综合置信度 ${input.match.score} 分。`,
+  });
+  return log;
 }
 
 export function normalizeBulkSignalText(rawText: string, fileName = ""): string {

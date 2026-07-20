@@ -1,5 +1,6 @@
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { existsSync } from 'node:fs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 // packages/core/src -> repo root
@@ -12,7 +13,13 @@ export const PARSER_PY = resolve(ROOT, 'services/parser-py/parse_ppt.py');
 export const PARSER_DOC = resolve(ROOT, 'services/parser-py/parse_doc.py');
 export const EMBED_PY = resolve(ROOT, 'services/parser-py/embed.py');
 export const RERANK_PY = resolve(ROOT, 'services/parser-py/rerank.py');
-export const PYTHON = process.env.SP_PYTHON || 'python3';
+const CODEX_RUNTIME_PYTHON = 'C:\\Users\\12266\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe';
+
+export function selectPythonBin(env: NodeJS.ProcessEnv = process.env, exists = existsSync): string {
+  return env.SP_PYTHON || (exists(CODEX_RUNTIME_PYTHON) ? CODEX_RUNTIME_PYTHON : 'python');
+}
+
+export const PYTHON = selectPythonBin();
 
 // 模型：解析(视觉)用便宜快的 sonnet，问答/生成用 opus
 export const MODEL_PARSE = process.env.SP_MODEL_PARSE || 'sonnet';

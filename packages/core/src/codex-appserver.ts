@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { TurnCallbacks } from './agent-backend.ts';
+import { resolveCodexCommand } from './codex-bin.ts';
 
 // ── GPT-5.5 后端：驱动 codex app-server（JSON-RPC over stdio）实现 token 级流式 ──
 // 关键：codex `exec --json` 只按 item 整段推送、给不了流式；而 `codex app-server` 默认
@@ -146,7 +147,8 @@ export class AppServerSession {
       '-c', `mcp_servers.salespilot-knowledge.command="${this.opts.mcp.command}"`,
       '-c', `mcp_servers.salespilot-knowledge.args=${JSON.stringify(this.opts.mcp.args)}`,
     ];
-    const ch = spawn('codex', args, {
+    const cmd = resolveCodexCommand(args);
+    const ch = spawn(cmd.command, cmd.args, {
       cwd: this.opts.runDir,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, INDATA_API_KEY: this.opts.apiKey },
