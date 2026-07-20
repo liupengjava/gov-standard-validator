@@ -29,6 +29,18 @@ python3 -m pip install --user pymupdf python-pptx sentence-transformers fastembe
 
 > 如需完整 VLM 文档解析，请确保本机可用 `soffice`（LibreOffice）以及 `codex` 或 `claude` CLI。
 
+### 新机器一键初始化（推荐）
+
+```bash
+./scripts/bootstrap_new_machine.sh
+```
+
+如需初始化后直接构建并启动：
+
+```bash
+./scripts/bootstrap_new_machine.sh --start
+```
+
 ## 2. 启动
 
 ```bash
@@ -56,4 +68,3 @@ services/parser-py/    文档解析、向量、重排脚本
 data/                  SQLite 数据库
 storage/               原始文件与解析产物
 ```
-
