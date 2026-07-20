@@ -1,0 +1,12 @@
+{
+  "name": "gov-standard-validator",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @gov-validator/web dev",
+    "build": "pnpm --filter @gov-validator/web build",
+    "start": "pnpm --filter @gov-validator/web start",
+    "lint": "pnpm --filter @gov-validator/web lint"
+  }
+}
+

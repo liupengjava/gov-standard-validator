@@ -1,0 +1,15 @@
+{
+  "name": "@gov-validator/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./config": "./src/config.ts",
+    "./db": "./src/db.ts",
+    "./parsing": "./src/parsing.ts",
+    "./retrieval": "./src/retrieval.ts",
+    "./ai-cli": "./src/ai-cli.ts",
+    "./vector-index": "./src/vector-index.ts"
+  }
+}
+

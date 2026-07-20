@@ -1,0 +1,14 @@
+[
+  { "canonical": "智能联络中心", "aliases": ["AICC", "智能客服中心"] },
+  { "canonical": "语音机器人", "aliases": ["VoiceAgent", "语音Agent", "外呼机器人", "AI外呼"] },
+  { "canonical": "机器人ID", "aliases": ["BOTID", "bot_id"] },
+  { "canonical": "反诈", "aliases": ["反欺诈", "防诈", "反电诈", "电诈防范"] },
+  { "canonical": "满意度", "aliases": ["满意度回访", "NPS", "客户满意度"] },
+  { "canonical": "接通率", "aliases": ["呼通率", "接听率"] },
+  { "canonical": "转化率", "aliases": ["成单率", "转化"] },
+  { "canonical": "质检", "aliases": ["智能质检", "会话质检"] },
+  { "canonical": "工单", "aliases": ["智能工单", "工单系统"] },
+  { "canonical": "知识库", "aliases": ["知识中心", "FAQ库"] },
+  { "canonical": "百应科技", "aliases": ["百应", "Baiying"] },
+  { "canonical": "数字人", "aliases": ["虚拟数字人", "数智人"] }
+]
