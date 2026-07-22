@@ -9,7 +9,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { NextRequest, NextResponse } from "next/server";
 import { PDFParse } from "pdf-parse";
-import { hasLowQualityPdfText } from "@/lib/pdf-extract";
+import { getPdfTextQualityError, hasLowQualityPdfText } from "@/lib/pdf-extract";
 
 export const runtime = "nodejs";
 
@@ -106,9 +106,11 @@ async function extractDocWithWordExtractor(inputPath: string) {
   };
 }
 
-async function extractPdfWithPython(inputPath: string, outdir: string, repoRoot: string) {
+async function extractPdfWithPython(inputPath: string, outdir: string, repoRoot: string, options: { forceOcr?: boolean } = {}) {
   const script = resolve(repoRoot, "services/parser-py/extract_pdf_text.py");
-  const { stdout } = await pexec(pythonBin(), [script, "--in", inputPath, "--outdir", outdir], {
+  const args = [script, "--in", inputPath, "--outdir", outdir];
+  if (options.forceOcr) args.push("--force-ocr");
+  const { stdout } = await pexec(pythonBin(), args, {
     timeout: 300000,
     maxBuffer: 32 * 1024 * 1024,
   });
@@ -140,17 +142,30 @@ async function extractPdfWithPdfParse(inputPath: string) {
 }
 
 async function extractPdf(inputPath: string, outdir: string, repoRoot: string) {
+  let nativeResult: Awaited<ReturnType<typeof extractPdfWithPython>> | null = null;
   try {
     const result = await extractPdfWithPython(inputPath, outdir, repoRoot);
+    nativeResult = result;
     if (!hasLowQualityPdfText(result.text)) return result;
   } catch {
     // Fall through to pdf.js extraction.
   }
-  const fallback = await extractPdfWithPdfParse(inputPath);
-  if (hasLowQualityPdfText(fallback.text)) {
-    throw new Error("PDF 文本层不可用，且扫描版 OCR 未能提取正文");
+  try {
+    const fallback = await extractPdfWithPdfParse(inputPath);
+    if (!hasLowQualityPdfText(fallback.text)) return fallback;
+  } catch {
+    // Fall through to OCR extraction.
   }
-  return fallback;
+  try {
+    const ocrResult = await extractPdfWithPython(inputPath, outdir, repoRoot, { forceOcr: true });
+    if (!hasLowQualityPdfText(ocrResult.text)) return { ...ocrResult, parser: ocrResult.parser || "windows-ocr" };
+    const qualityError = getPdfTextQualityError(ocrResult.text);
+    if (qualityError) throw new Error(qualityError);
+    return ocrResult;
+  } catch (error) {
+    if (nativeResult?.text && !hasLowQualityPdfText(nativeResult.text)) return nativeResult;
+    throw error;
+  }
 }
 
 async function extractLegacyDocFallback(inputPath: string) {

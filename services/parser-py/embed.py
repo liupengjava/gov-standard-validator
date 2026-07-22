@@ -44,6 +44,35 @@ def embed_st(texts):
     model = SentenceTransformer(MODEL)
     return model.encode(texts, normalize_embeddings=True).tolist()
 
+def embed_hash(texts):
+    """离线兜底：当模型不可用时，使用稳定哈希向量，保证检索链路可用。"""
+    import math, re, hashlib
+    dim = int(os.environ.get("SP_EMBED_HASH_DIM", "1024"))
+    out = []
+    for t in texts:
+        vec = [0.0] * dim
+        text = (t or "").strip()
+        # 中英文混合：中文按2字滑窗，英文按词
+        zh = re.findall(r"[\u4e00-\u9fff]+", text)
+        en = re.findall(r"[A-Za-z0-9_]{2,}", text.lower())
+        tokens = []
+        for s in zh:
+            if len(s) < 2:
+                tokens.append(s)
+            else:
+                tokens.extend(s[i:i+2] for i in range(len(s) - 1))
+        tokens.extend(en)
+        if not tokens:
+            tokens = [text[:32] or "<empty>"]
+        for tok in tokens:
+            h = hashlib.sha256(tok.encode("utf-8", "ignore")).digest()
+            i = int.from_bytes(h[:4], "little") % dim
+            sign = -1.0 if (h[4] & 1) else 1.0
+            vec[i] += sign
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        out.append([v / norm for v in vec])
+    return out
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -67,6 +96,11 @@ def main():
             return
         except Exception as e:
             last = e
+    # 离线容灾：默认启用哈希向量，避免整条向量检索链路失效。
+    if os.environ.get("SP_EMBED_ALLOW_HASH", "1") != "0":
+        vecs = embed_hash(texts)
+        json.dump(vecs, open(args.outfile, "w"), ensure_ascii=False)
+        return
     print(f"embedding unavailable: {last}", file=sys.stderr)
     sys.exit(2)
 

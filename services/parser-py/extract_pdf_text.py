@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -14,6 +15,49 @@ def normalize_text(text: str) -> str:
         if cleaned:
             lines.append(cleaned)
     return "\n".join(lines)
+
+
+COMMON_CHINESE = set("的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方后多定行学法所民得经")
+STANDARD_TERMS = ("标准", "服务", "要求", "范围", "规范", "条款", "部分", "目录", "实施", "发布", "术语", "定义", "引用", "文件", "规定", "适用", "管理", "平台", "政务", "信息", "数据", "安全", "编码")
+MOJIBAKE_CHARS = set("鍚夋灄鐪噯姟鏉愭枡搴撴暟鎹鑼骞鏈鏃甯")
+EMBEDDED_FONT_NOISE_CHARS = set("狂狞檬犭祌卅豺沛汸迋昊暇沅")
+
+
+def has_low_quality_text(text: str) -> bool:
+    compact = "".join(str(text or "").split())
+    if len(compact) < 20:
+        return True
+
+    without_page_markers = re.sub(r"--\s*\d+\s+of\s+\d+\s*--", "", text, flags=re.I)
+    without_page_markers = re.sub(r"[-\s]", "", without_page_markers)
+    if len(without_page_markers) < max(12, int(len(compact) * 0.2)):
+        return True
+
+    replacement_count = len(re.findall(r"[?�锟]", compact))
+    cjk_chars = re.findall(r"[\u4e00-\u9fff]", compact)
+    cjk_count = len(cjk_chars)
+    common_count = sum(1 for ch in cjk_chars if ch in COMMON_CHINESE)
+    standard_term_count = sum(compact.count(term) for term in STANDARD_TERMS)
+    mojibake_count = sum(1 for ch in cjk_chars if ch in MOJIBAKE_CHARS)
+    embedded_noise_count = sum(1 for ch in cjk_chars if ch in EMBEDDED_FONT_NOISE_CHARS)
+    embedded_glyph_count = len(re.findall(r"/G[0-9A-F]{2}\b", text, flags=re.I))
+    cid_glyph_count = len(re.findall(r"\(cid:\d+\)", text, flags=re.I))
+
+    if cid_glyph_count >= 2:
+        return True
+    if replacement_count >= 6 and replacement_count / len(compact) > 0.08:
+        return True
+    if replacement_count > cjk_count and replacement_count > 10:
+        return True
+    if embedded_glyph_count >= 4 and cjk_count >= 8 and common_count / cjk_count < 0.18:
+        return True
+    if cjk_count >= 24 and mojibake_count / cjk_count > 0.22 and standard_term_count == 0:
+        return True
+    if cjk_count >= 24 and embedded_noise_count / cjk_count > 0.12 and common_count / cjk_count < 0.08:
+        return True
+    if cjk_count >= 80 and common_count / cjk_count < 0.03 and standard_term_count == 0:
+        return True
+    return False
 
 
 def normalize_ocr_text(text: str) -> str:
@@ -77,6 +121,7 @@ def main() -> None:
     parser.add_argument("--in", dest="inp", required=True)
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--ocr-max-pages", type=int, default=int(os.environ.get("SP_PDF_OCR_MAX_PAGES", "40")))
+    parser.add_argument("--force-ocr", action="store_true")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -85,19 +130,20 @@ def main() -> None:
     parser_name = "pypdf"
     text = ""
     errors = []
-    try:
-        text = normalize_text(extract_with_pypdf(args.inp))
-    except Exception as exc:
-        errors.append(f"pypdf: {exc}")
+    if not args.force_ocr:
+        try:
+            text = normalize_text(extract_with_pypdf(args.inp))
+        except Exception as exc:
+            errors.append(f"pypdf: {exc}")
 
-    if len(text) < 20:
+    if not args.force_ocr and has_low_quality_text(text):
         try:
             text = normalize_text(extract_with_pdfplumber(args.inp))
             parser_name = "pdfplumber"
         except Exception as exc:
             errors.append(f"pdfplumber: {exc}")
 
-    if len(text) < 20:
+    if has_low_quality_text(text):
         try:
             text = extract_with_windows_ocr(args.inp, args.ocr_max_pages)
             parser_name = "windows-ocr"

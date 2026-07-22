@@ -260,6 +260,231 @@ export function sliceKnowledgeText(raw: string, sourceType = "上传标准文本
   }));
 }
 
+export type DraftTextSliceStatus = "pending" | "confirmed";
+
+export type DraftTextSlice = {
+  id: string;
+  title: string;
+  text: string;
+  sourceName: string;
+  charCount: number;
+  status: DraftTextSliceStatus;
+};
+
+function isExtractedTableSeparator(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed.length > 0 && /^[|｜\s:-]+$/.test(trimmed) && /[|｜]/.test(trimmed);
+}
+
+function extractedTableCells(line: string): string[] {
+  return line
+    .split(/[|｜]/)
+    .map((cell) => cell.trim())
+    .filter(Boolean);
+}
+
+function isConcreteTableClauseLine(line: string): boolean {
+  const cells = extractedTableCells(line);
+  return cells.length >= 2 && /^\d+$/.test(cells[0]) && /[\u4e00-\u9fa5A-Za-z]/.test(cells[1]);
+}
+
+function restoreSplitTableNumbers(lines: string[]): string[] {
+  const restored: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const current = lines[index]?.trim() || "";
+    const next = lines[index + 1]?.trim() || "";
+    if (/^\d+$/.test(current) && /^\d+\s*[|｜]/.test(next)) {
+      restored.push(`${current}${next}`);
+      index += 1;
+      continue;
+    }
+    restored.push(current);
+  }
+  return restored;
+}
+
+function buildTableDraftSlices(lines: string[], sourceName: string): DraftTextSlice[] {
+  const blocks: { title: string; parts: string[] }[] = [];
+
+  for (const line of restoreSplitTableNumbers(lines)) {
+    if (!line || isExtractedTableSeparator(line)) continue;
+    if (isConcreteTableClauseLine(line)) {
+      const cells = extractedTableCells(line);
+      const title = `${cells[0]} ${cells.slice(1, 3).join(" | ")}`;
+      blocks.push({ title, parts: [cells.join(" | ")] });
+      continue;
+    }
+    if (blocks.length && !/^\d+$/.test(line)) {
+      blocks[blocks.length - 1].parts.push(line);
+    }
+  }
+
+  if (blocks.length < 2) return [];
+  return blocks.map((block, index) => {
+    const text = block.parts.join("\n").trim();
+    return {
+      id: `DV-${String(index + 1).padStart(3, "0")}`,
+      title: block.title,
+      text,
+      sourceName,
+      charCount: text.length,
+      status: "pending",
+    };
+  });
+}
+
+function isDraftClauseHeading(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed || /^\d+$/.test(trimmed) || isExtractedTableSeparator(trimmed) || /^\d+\s*[|｜]/.test(trimmed)) return false;
+  return /^(?:第[一二三四五六七八九十百零〇\d]+条|[一二三四五六七八九十]+、|\d+(?:\.\d+)*[、.．]?\s+).+/.test(trimmed);
+}
+
+export function sliceDraftTextForReview(text: string, sourceName = "待验证文本"): DraftTextSlice[] {
+  const cleanText = normalizeWhitespace(text || DRAFT_SAMPLE);
+  const lines = cleanText.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const tableSlices = buildTableDraftSlices(lines, sourceName);
+  if (tableSlices.length) return tableSlices;
+
+  const blocks: string[] = [];
+  let current: string[] = [];
+  for (const line of lines) {
+    if (isDraftClauseHeading(line) && current.length) {
+      blocks.push(current.join("\n"));
+      current = [line];
+      continue;
+    }
+    current.push(line);
+  }
+  if (current.length) blocks.push(current.join("\n"));
+  const candidates = blocks.length > 1 ? blocks : lines.filter((line) => !/^\d+$/.test(line) && !isExtractedTableSeparator(line));
+
+  return candidates.map((block, index) => {
+    const [firstLine = "", ...rest] = block.split(/\n+/);
+    const hasHeading = isDraftClauseHeading(firstLine);
+    const textBody = hasHeading && rest.length ? rest.join("\n") : block;
+    return {
+      id: `DV-${String(index + 1).padStart(3, "0")}`,
+      title: hasHeading ? firstLine.trim() : `切片 ${index + 1}`,
+      text: textBody.trim(),
+      sourceName,
+      charCount: textBody.trim().length,
+      status: "pending",
+    };
+  });
+}
+
+export type KnowledgeCatalogSearchTaskStatus = "待检索" | "检索中" | "已获取";
+
+export type KnowledgeCatalogSearchTask = {
+  id: string;
+  fileName: string;
+  status: KnowledgeCatalogSearchTaskStatus;
+  searchUrl: string;
+  sourceSite: string;
+  addedAt: string;
+  matchedTitle?: string;
+  message: string;
+};
+
+export function buildKnowledgeCatalogSearchTasks(catalog: string, addedAt: string): KnowledgeCatalogSearchTask[] {
+  return catalog
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((fileName, index) => {
+      const query = `${fileName} PDF 标准`;
+      return {
+        id: `KCS-${String(index + 1).padStart(3, "0")}`,
+        fileName,
+        status: "待检索",
+        searchUrl: `https://www.baidu.com/s?wd=${encodeURIComponent(query)}`,
+        sourceSite: "互联网检索",
+        addedAt,
+        message: "已生成检索任务，待打开互联网获取文件。",
+      };
+    });
+}
+
+export type KnowledgeFileSourceType = "upload" | "web";
+export type KnowledgeVectorStatus = "待构建" | "构建中" | "已完成";
+
+export type KnowledgeFileAsset = {
+  id: string;
+  name: string;
+  sourceType: KnowledgeFileSourceType;
+  sourceLabel: string;
+  addedAt: string;
+  sliceCount: number;
+  vectorProgress: number;
+  vectorStatus: KnowledgeVectorStatus;
+  vectorLogs: string[];
+  accessCount: number;
+  callCount: number;
+  lastAccessedAt?: string;
+  lastCalledAt?: string;
+};
+
+function knowledgeFileId(name: string, addedAt: string): string {
+  const seed = `${name}-${addedAt}`;
+  let hash = 0;
+  for (let i = 0; i < seed.length; i += 1) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  return `KF-${hash.toString(36).padStart(8, "0")}`;
+}
+
+export function buildKnowledgeFileAsset({
+  name,
+  sourceType,
+  sourceLabel,
+  addedAt,
+  sliceCount,
+  vectorProgress = 0,
+}: {
+  name: string;
+  sourceType: KnowledgeFileSourceType;
+  sourceLabel: string;
+  addedAt: string;
+  sliceCount: number;
+  vectorProgress?: number;
+}): KnowledgeFileAsset {
+  const progress = Math.max(0, Math.min(100, Math.round(vectorProgress)));
+  return {
+    id: knowledgeFileId(name, addedAt),
+    name,
+    sourceType,
+    sourceLabel,
+    addedAt,
+    sliceCount,
+    vectorProgress: progress,
+    vectorStatus: progress >= 100 ? "已完成" : progress > 0 ? "构建中" : "待构建",
+    vectorLogs: [
+      `${addedAt} 文件加入知识库：${name}`,
+      `${addedAt} 已生成 ${sliceCount} 个知识切片，向量构建进度 ${progress}%`,
+    ],
+    accessCount: 0,
+    callCount: 0,
+  };
+}
+
+export function updateKnowledgeVectorBuild(asset: KnowledgeFileAsset, at: string): KnowledgeFileAsset {
+  return {
+    ...asset,
+    vectorProgress: 100,
+    vectorStatus: "已完成",
+    vectorLogs: asset.vectorLogs.concat(`${at} 向量索引构建完成，可进入验证召回。`),
+  };
+}
+
+export function recordKnowledgeFileUsage(asset: KnowledgeFileAsset, usage: "access" | "call", at: string): KnowledgeFileAsset {
+  return {
+    ...asset,
+    accessCount: asset.accessCount + 1,
+    callCount: usage === "call" ? asset.callCount + 1 : asset.callCount,
+    lastAccessedAt: at,
+    lastCalledAt: usage === "call" ? at : asset.lastCalledAt,
+    vectorLogs: asset.vectorLogs.concat(`${at} ${usage === "call" ? "验证任务调用" : "用户访问"}：${asset.name}`),
+  };
+}
+
 function tokenizeText(text: string, clauses: Clause[]): Set<string> {
   const normalized = text.replace(/[，。；：、“”‘’（）()]/g, " ");
   const tokens = new Set<string>();
@@ -343,12 +568,119 @@ export function runDocumentValidation(text: string, clauses: Clause[]): { issues
   };
 }
 
+export type VerificationPointStatus = "pending" | "accepted" | "rejected";
+
+export type KeyVerificationPoint = {
+  id: string;
+  title: string;
+  status: VerificationPointStatus;
+  locator: string;
+  level: "高" | "中" | "低";
+  category: string;
+  riskLabel: string;
+  originalLocation: string;
+  problemJudgment: string;
+  references: string;
+  evidence: string;
+  revisionAdvice: string;
+  suggestedText: string;
+  confidence: number;
+  reviewStatus: string;
+};
+
+function riskLabelFromLevel(level: string): string {
+  if (level.includes("高")) return "高风险";
+  if (level.includes("中")) return "中风险";
+  return "低风险";
+}
+
+export function buildKeyVerificationPoints({ issues, match }: { issues: [string, string, string][]; match: MatchResult }): KeyVerificationPoint[] {
+  const issuePoints = issues.map(([level, title, advice], index) => ({
+    id: `VP-${String(index + 1).padStart(3, "0")}`,
+    title,
+    status: "pending" as VerificationPointStatus,
+    locator: `正文第 ${index + 1} 处`,
+    level: level.includes("高") ? ("高" as const) : level.includes("中") ? ("中" as const) : ("低" as const),
+    category: match.clause.dimension,
+    riskLabel: riskLabelFromLevel(level),
+    originalLocation: match.targetText.slice(0, 80),
+    problemJudgment: `${title}：${advice}`,
+    references: `${match.clause.source} / ${match.clause.id}`,
+    evidence: match.issues[index] || match.issues[0] || match.clause.text,
+    revisionAdvice: advice.includes("建议") ? advice : `建议${advice}`,
+    suggestedText: advice.replace(/^建议/, "建议在原条款中"),
+    confidence: Math.max(60, Math.min(98, match.score - index * 3)),
+    reviewStatus: "待专家确认",
+  }));
+
+  return issuePoints.concat({
+    id: `VP-${String(issuePoints.length + 1).padStart(3, "0")}`,
+    title: "标准条款一致性比对",
+    status: "pending",
+    locator: "知识库召回结果",
+    level: match.score >= 85 ? "低" : match.score >= 70 ? "中" : "高",
+    category: match.clause.dimension,
+    riskLabel: match.score >= 85 ? "低风险" : match.score >= 70 ? "中风险" : "高风险",
+    originalLocation: match.targetText.slice(0, 80),
+    problemJudgment: `与 ${match.clause.id} 的综合置信度为 ${match.score} 分，${match.conclusion}。`,
+    references: `${match.clause.source} / ${match.clause.id}`,
+    evidence: match.clause.text,
+    revisionAdvice: `建议围绕 ${match.overlap.slice(0, 4).join("、") || match.clause.dimension} 补充依据、责任主体和执行口径。`,
+    suggestedText: `建议补充与 ${match.clause.id} 对应的执行条件、责任主体和留痕要求。`,
+    confidence: match.score,
+    reviewStatus: "待专家确认",
+  });
+}
+
+export function verificationPointsAllConfirmed(points: KeyVerificationPoint[]): boolean {
+  return points.length > 0 && points.every((point) => point.status === "accepted" || point.status === "rejected");
+}
+
+export function buildFormattedVerificationReport({
+  draftFileName,
+  match,
+  points,
+}: {
+  draftFileName: string;
+  match: MatchResult;
+  points: KeyVerificationPoint[];
+}): string {
+  const confirmed = verificationPointsAllConfirmed(points) ? "专家确认完成" : "专家确认未完成";
+  const pointSections = points
+    .map((point, index) => {
+      const decision = point.status === "accepted" ? "采纳意见" : point.status === "rejected" ? "拒绝意见" : "待确认";
+      return `${index + 1}. ${point.title}
+确认结果：${decision}
+风险等级：${point.riskLabel}
+原文位置：${point.originalLocation}
+问题判断：${point.problemJudgment}
+标准依据：${point.references}
+证据摘录：${point.evidence}
+修订建议：${point.revisionAdvice}`;
+    })
+    .join("\n\n");
+
+  return `格式化验证报告
+
+文档名称：${draftFileName}
+专家状态：${confirmed}
+匹配条款：${match.clause.id}
+综合置信度：${match.score} 分
+总体结论：${match.conclusion}
+
+一、逐项关键验证点
+${pointSections}
+
+二、报告结论
+本报告已记录每个关键验证点的采纳意见或拒绝意见，可作为标准草案修订和专家复核的结构化依据。`;
+}
+
 export function isReadableDraftAttachment(fileName: string): boolean {
   return /\.(txt|md|markdown|csv|tsv|json|xml|html|htm|log)$/i.test(fileName);
 }
 
 export function isServerParsedDraftAttachment(fileName: string): boolean {
-  return /\.(docx|doc)$/i.test(fileName);
+  return /\.(pdf|docx|doc)$/i.test(fileName);
 }
 
 export function isServerParsedKnowledgeAttachment(fileName: string): boolean {
@@ -426,6 +758,8 @@ export type AgentExecutionLogLine = {
   phase: string;
   message: string;
 };
+
+export const AGENT_LOG_PLAYBACK_DELAY_MS = 280;
 
 export function beginAgentExecutionRun(currentRunId: number): { runId: number; currentRunId: number } {
   const runId = currentRunId + 1;
@@ -555,6 +889,64 @@ export function buildAgentExecutionLog(input: {
   return log;
 }
 
+export function buildAgentThinkingExecutionLog(input: {
+  text: string;
+  sourceType: string;
+  fileName: string;
+  issues: [string, string, string][];
+  match: MatchResult;
+}): AgentExecutionLogLine[] {
+  const cleanText = normalizeWhitespace(input.text || DRAFT_SAMPLE);
+  const topIssue = input.issues[0]?.[1] || "未发现高优先级问题";
+  const sourceLabel = input.sourceType || "自动识别";
+  const fileLabel = input.fileName || "粘贴文本";
+  const overlap = input.match.overlap.slice(0, 5).join("、") || input.match.clause.dimension;
+  const lines: Omit<AgentExecutionLogLine, "time">[] = [
+    {
+      kind: "system",
+      phase: "命令接收",
+      message: `用户命令：对 ${fileLabel} 执行文本验证，输入类型按 ${sourceLabel} 处理，正文长度 ${cleanText.length} 字。`,
+    },
+    {
+      kind: "reasoning",
+      phase: "输入理解",
+      message: `输入理解：识别待验证文本来源、正文范围和条款表达，优先关注义务性表述、例外条件、责任主体和群众权益相关内容。`,
+    },
+    {
+      kind: "action",
+      phase: "任务拆解",
+      message: "任务拆解：将验证任务拆成文本切片复核、规则校验、知识库召回、差异判断、关键验证点生成和报告组装。",
+    },
+    {
+      kind: "action",
+      phase: "工具调用",
+      message: `模拟工具调用：调用文本切片器、规则校验器和条款召回器，当前命中 ${input.issues.length} 类问题线索。`,
+    },
+    {
+      kind: "evidence",
+      phase: "证据读取",
+      message: `证据读取：读取命中关键词 ${overlap}，主要参照 ${input.match.clause.id}，并保留条款原文用于专家复核。`,
+    },
+    {
+      kind: "reasoning",
+      phase: "差异判断",
+      message: `差异判断：当前优先关注“${topIssue}”，结合相似度 ${input.match.similarity}% 和综合置信度 ${input.match.score} 分形成可审计结论。`,
+    },
+    {
+      kind: "action",
+      phase: "执行落地",
+      message: `执行落地：生成 ${input.issues.length + 1} 个关键验证点，进入专家逐项确认流程，支持采纳意见或拒绝意见。`,
+    },
+    {
+      kind: "result",
+      phase: "结果输出",
+      message: "结果输出：等待所有验证点逐项确认后，汇总专家意见、证据依据和格式化验证报告下载内容。",
+    },
+  ];
+
+  return lines.map((line, index) => ({ ...line, time: logTime(index) }));
+}
+
 export function normalizeBulkSignalText(rawText: string, fileName = ""): string {
   let text = rawText.replace(/\r/g, "\n");
   const name = fileName.toLowerCase();
@@ -599,4 +991,3 @@ export function normalizeBulkSignalText(rawText: string, fileName = ""): string 
 export function runSearchSimulation(keyword: string): string[] {
   return SEARCH_SAMPLES.slice(0, 3).map((item) => `${keyword}｜${item}`);
 }
-

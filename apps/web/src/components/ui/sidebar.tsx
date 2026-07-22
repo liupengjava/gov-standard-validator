@@ -85,7 +85,7 @@ export function Sidebar({
         <aside
           data-sidebar="sidebar"
           className={cn(
-            "fixed inset-y-0 left-0 z-50 flex w-[244px] shrink-0 flex-col border-r border-sidebar-border bg-sidebar transition-transform duration-200",
+            "fixed inset-y-0 left-0 z-50 flex w-[252px] shrink-0 flex-col border-r border-sidebar-border bg-sidebar/95 backdrop-blur transition-transform duration-200",
             !openMobile && "-translate-x-full",
             className
           )}
@@ -101,7 +101,7 @@ export function Sidebar({
     <aside
       data-sidebar="sidebar"
       className={cn(
-        "flex w-[244px] shrink-0 flex-col border-r border-sidebar-border bg-sidebar",
+        "my-6 ml-6 flex h-[calc(100vh-48px)] w-[228px] shrink-0 flex-col rounded-lg border border-sidebar-border bg-white/92 backdrop-blur shadow-[0_24px_70px_rgba(30,114,188,0.12)]",
         className
       )}
       {...props}
@@ -114,7 +114,7 @@ export function Sidebar({
 export function SidebarHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
-      className={cn("flex h-16 items-center gap-2.5 border-b border-sidebar-border px-5", className)}
+      className={cn("flex h-[76px] items-center gap-3 border-b border-sidebar-border px-5", className)}
       {...props}
     />
   );
@@ -122,13 +122,13 @@ export function SidebarHeader({ className, ...props }: React.ComponentProps<"div
 
 export function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
   return (
-    <div className={cn("flex-1 space-y-1 overflow-y-auto px-2.5 py-3 text-sm", className)} {...props} />
+    <div className={cn("flex-1 space-y-1.5 overflow-y-auto px-3 py-4 text-sm", className)} {...props} />
   );
 }
 
 export function SidebarFooter({ className, ...props }: React.ComponentProps<"div">) {
   return (
-    <div className={cn("border-t border-sidebar-border px-2.5 py-3 text-sm", className)} {...props} />
+    <div className={cn("border-t border-sidebar-border px-3 py-4 text-sm", className)} {...props} />
   );
 }
 
@@ -141,8 +141,8 @@ export function SidebarMenuButton({
   return (
     <button
       className={cn(
-        "flex w-full items-center gap-3 rounded-lg px-3 py-2 font-semibold text-sidebar-foreground hover:bg-muted",
-        active && "bg-accent text-accent-foreground",
+        "flex h-11 w-full items-center gap-3 rounded-lg px-3 text-left font-semibold text-sidebar-foreground transition-all hover:bg-[#eaf6ff] hover:text-[#075ec9]",
+        active && "bg-linear-to-r from-[#e2f3ff] to-white text-accent-foreground shadow-[inset_3px_0_0_#168df3,0_8px_20px_rgba(22,141,243,0.08)]",
         className
       )}
       {...props}

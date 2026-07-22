@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { DB_PATH } from './config.ts';
+import { DB_PATH, PYTHON } from './config.ts';
 import { autoClassifyAsset } from './industry-classify.ts';
 import { classifyBusinessTypeFromGroupName } from './business-types.ts';
 
@@ -19,7 +19,12 @@ const VEC_DIM = Number(process.env.SP_EMBED_DIM || 1024);
 function resolveVecPath(): string | null {
   if (process.env.SP_SQLITE_VEC) return process.env.SP_SQLITE_VEC;
   try {
-    return execFileSync('python3', ['-c', 'import sqlite_vec;print(sqlite_vec.loadable_path())'], { encoding: 'utf-8' }).trim() || null;
+    const py = process.env.SP_PYTHON || process.env.PYTHON || PYTHON || 'python';
+    return execFileSync(
+      py,
+      ['-c', 'import sqlite_vec;print(sqlite_vec.loadable_path())'],
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim() || null;
   } catch { return null; }
 }
 
