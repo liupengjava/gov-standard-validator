@@ -1,4 +1,5 @@
 import { chunkStandardDocument, type StandardChunk } from "@gov-validator/core/standard-chunker";
+import type { PublicSignalEvidenceItem } from "./signal-collector";
 
 export type Clause = {
   id: string;
@@ -16,7 +17,44 @@ export type SignalSample = {
   type: string;
   text: string;
   status: string;
+  confidence?: number;
+  confidenceParts?: SignalImportConfidenceParts;
+  matchedClauseId?: string;
+  matchedClauseSource?: string;
+  evaluationText?: string;
+  reviewStatus?: string;
+  sourceUrl?: string;
+  pageTitle?: string;
+  publishedAt?: string;
+  capturedAt?: string;
+  snapshotUrl?: string;
+  evidenceStatus?: "real_collected" | "simulated" | "imported";
+  evidenceChain?: PublicSignalEvidenceItem[];
 };
+
+export type SignalImportConfidenceParts = {
+  relevance: number;
+  completeness: number;
+  comparability: number;
+  dataQuality: number;
+};
+
+export type SignalImportCandidate = Omit<SignalSample, "id" | "status"> & {
+  candidateId: string;
+  confidence: number;
+  confidenceParts: SignalImportConfidenceParts;
+  matchedClauseId: string;
+  matchedClauseSource: string;
+  evaluationText: string;
+  reviewStatus: string;
+};
+
+export function resetSignalSamplesForRetest(_signals: SignalSample[], _selectedSignalIndex: number): {
+  signals: SignalSample[];
+  selectedSignalIndex: number;
+} {
+  return { signals: [], selectedSignalIndex: 0 };
+}
 
 export const CLAUSE_SAMPLE =
   "材料不齐全时，窗口可以告知申请人补正材料；线上预审结果可供窗口参考，线下受理人员根据实际情况决定是否再次收取纸质材料。";
@@ -157,14 +195,6 @@ export const INTERFACE_SAMPLES: Record<string, string[]> = {
   ],
   杭州公安政务服务网: ["网站事项指南与窗口公告版本不一致。", "群众留言集中反映办理流程说明过于笼统。"],
 };
-
-const SEARCH_SAMPLES = [
-  "线上办理已经提示预审通过，窗口仍要求重新提交纸质复印件，群众认为线上线下口径不一致。",
-  "公开留言反映办理进度查询不够透明，提交材料后不知道当前处于哪个审核环节。",
-  "网页评论提到窗口排队时间较长，叫号屏只显示号码，无法判断具体办理窗口和业务类型。",
-  "地方问政平台出现关于一次性告知不到位的反馈，申请人多次补交材料后仍被退回。",
-  "公开咨询中多次出现老年人不会使用自助设备、现场缺少引导人员的问题。",
-];
 
 export function inferDimension(text: string): Clause["dimension"] {
   if (/材料|补正|纸质|上传/.test(text)) return "材料";
@@ -458,11 +488,67 @@ export function buildKnowledgeFileAsset({
     vectorStatus: progress >= 100 ? "已完成" : progress > 0 ? "构建中" : "待构建",
     vectorLogs: [
       `${addedAt} 文件加入知识库：${name}`,
-      `${addedAt} 已生成 ${sliceCount} 个知识切片，向量构建进度 ${progress}%`,
+      sliceCount > 0
+        ? `${addedAt} 已生成 ${sliceCount} 个知识切片，向量构建进度 ${progress}%`
+        : `${addedAt} 待自动切分知识切片，向量构建进度 ${progress}%`,
     ],
     accessCount: 0,
     callCount: 0,
   };
+}
+
+function knowledgeFileStandardName(fileName: string): string {
+  return fileName.replace(/\.[a-z0-9]{2,5}$/i, "");
+}
+
+export function buildKnowledgeFileAutoSlices(asset: KnowledgeFileAsset, baseCount = 0, desiredCount?: number): Clause[] {
+  const standardName = knowledgeFileStandardName(asset.name);
+  const candidateCount = desiredCount ?? (asset.sliceCount || Math.ceil(standardName.length * 1.2));
+  const count = Math.max(3, Math.min(28, candidateCount));
+  const templates: Array<{ dimension: Clause["dimension"]; constraint: Clause["constraint"]; text: string; keywords: string[] }> = [
+    {
+      dimension: "材料",
+      constraint: "应",
+      text: "材料清单应与线上申请、窗口受理和补正告知要求保持一致，避免重复提交。",
+      keywords: ["材料", "补正", "一次性", "告知", "检索"],
+    },
+    {
+      dimension: "流程",
+      constraint: "应",
+      text: "事项办理流程应明确申请、受理、审核、办结和反馈环节，并保留过程记录。",
+      keywords: ["流程", "受理", "审核", "反馈", "检索"],
+    },
+    {
+      dimension: "资源",
+      constraint: "宜",
+      text: "服务资源、目录字段和数据接口宜统一编码，支撑跨系统协同调用。",
+      keywords: ["资源", "目录", "接口", "数据质量", "检索"],
+    },
+    {
+      dimension: "安全",
+      constraint: "应",
+      text: "涉及敏感数据、身份信息和办理记录的资源应开展安全评估并落实脱敏处理。",
+      keywords: ["安全", "敏感", "脱敏", "权限", "检索"],
+    },
+    {
+      dimension: "评价",
+      constraint: "应",
+      text: "应建立咨询、评价、投诉和回访机制，及时处理差评意见并形成闭环记录。",
+      keywords: ["评价", "投诉", "回访", "差评", "检索"],
+    },
+  ];
+
+  return Array.from({ length: count }, (_, index) => {
+    const template = templates[index % templates.length];
+    return {
+      id: `WEB-${String(baseCount + index + 1).padStart(3, "0")}`,
+      source: standardName,
+      dimension: template.dimension,
+      constraint: template.constraint,
+      text: `${standardName}：${template.text}`,
+      keywords: [...new Set([standardName, ...template.keywords])].slice(0, 12),
+    };
+  });
 }
 
 export function updateKnowledgeVectorBuild(asset: KnowledgeFileAsset, at: string): KnowledgeFileAsset {
@@ -471,6 +557,20 @@ export function updateKnowledgeVectorBuild(asset: KnowledgeFileAsset, at: string
     vectorProgress: 100,
     vectorStatus: "已完成",
     vectorLogs: asset.vectorLogs.concat(`${at} 向量索引构建完成，可进入验证召回。`),
+  };
+}
+
+export function nextKnowledgeVectorBuildStep(asset: KnowledgeFileAsset, at: string, targetProgress?: number): KnowledgeFileAsset {
+  const nextProgress = Math.max(
+    asset.vectorProgress,
+    Math.min(100, Math.round(targetProgress ?? asset.vectorProgress + 20))
+  );
+  if (nextProgress >= 100) return updateKnowledgeVectorBuild({ ...asset, vectorProgress: nextProgress }, at);
+  return {
+    ...asset,
+    vectorProgress: nextProgress,
+    vectorStatus: nextProgress > 0 ? "构建中" : "待构建",
+    vectorLogs: asset.vectorLogs.concat(`${at} 向量构建推进至 ${nextProgress}%，正在生成条款语义索引。`),
   };
 }
 
@@ -483,6 +583,42 @@ export function recordKnowledgeFileUsage(asset: KnowledgeFileAsset, usage: "acce
     lastCalledAt: usage === "call" ? at : asset.lastCalledAt,
     vectorLogs: asset.vectorLogs.concat(`${at} ${usage === "call" ? "验证任务调用" : "用户访问"}：${asset.name}`),
   };
+}
+
+export function knowledgeClauseKey(clause: Pick<Clause, "source" | "id">): string {
+  return `${clause.source}::${clause.id}`;
+}
+
+function clauseMatchesSemanticQuery(clause: Clause, query: string): boolean {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) return true;
+  const haystack = [clause.id, clause.source, clause.dimension, clause.constraint, clause.text, ...clause.keywords].join(" ").toLowerCase();
+  if (haystack.includes(normalizedQuery)) return true;
+  const queryTokens = normalizedQuery.split(/[\s,，;；、|/]+/).filter(Boolean);
+  if (queryTokens.length > 1 && queryTokens.some((token) => haystack.includes(token))) return true;
+  return clause.keywords.some((keyword) => normalizedQuery.includes(keyword.toLowerCase()) || keyword.toLowerCase().includes(normalizedQuery));
+}
+
+export function filterVectorKnowledgeClauses({
+  clauses,
+  knowledgeFiles,
+  clauseAssetIds,
+  query,
+  dimension,
+}: {
+  clauses: Clause[];
+  knowledgeFiles: KnowledgeFileAsset[];
+  clauseAssetIds: Record<string, string>;
+  query: string;
+  dimension: string;
+}): Clause[] {
+  const completedAssetIds = new Set(knowledgeFiles.filter((file) => file.vectorStatus === "已完成").map((file) => file.id));
+  return clauses.filter((clause) => {
+    const assetId = clauseAssetIds[knowledgeClauseKey(clause)];
+    if (!assetId || !completedAssetIds.has(assetId)) return false;
+    if (dimension !== "全部" && clause.dimension !== dimension) return false;
+    return clauseMatchesSemanticQuery(clause, query);
+  });
 }
 
 function tokenizeText(text: string, clauses: Clause[]): Set<string> {
@@ -566,6 +702,75 @@ export function runDocumentValidation(text: string, clauses: Clause[]): { issues
     issues: validateDraft(text),
     match: compareStandardText(text || DRAFT_SAMPLE, clauses),
   };
+}
+
+function splitSignalImportRow(line: string): string[] {
+  const separator = line.includes("\t") ? "\t" : line.includes("|") ? "|" : ",";
+  return line
+    .split(separator)
+    .map((cell) => cell.trim().replace(/^"|"$/g, ""))
+    .filter(Boolean);
+}
+
+function isSignalImportHeader(line: string): boolean {
+  const headerHits = (line.match(/序号|编号|来源|内容|文本|反馈内容|问题描述|事项|办理环节|content|text|feedback|summary/gi) || []).length;
+  return headerHits >= 2 || (headerHits >= 1 && !/(群众|申请人|用户|窗口|材料|投诉|评价|排队|补正|线上|线下|纸质|大厅|自助|敏感)/.test(line));
+}
+
+function pickSignalImportText(line: string): string {
+  const cells = splitSignalImportRow(line);
+  if (cells.length <= 1) return line.trim();
+  const preferred = cells.find((cell) => /(群众|窗口|材料|办理|投诉|评价|排队|补正|线上|线下|纸质|大厅|自助|敏感|目录)/.test(cell) && cell.length >= 8);
+  return preferred || cells.find((cell) => cell.length >= 12) || cells.join(" ");
+}
+
+function signalDataQualityScore(text: string): number {
+  let score = 14;
+  if (text.length >= 24) score += 2;
+  if (!/[^\u4e00-\u9fa5A-Za-z0-9，。；：、“”‘’（）()《》？！,.!?;:\s-]/.test(text)) score += 2;
+  if (!/(undefined|null|NaN|#{3,}|\.{5,})/i.test(text)) score += 2;
+  return Math.min(20, score);
+}
+
+export function buildSignalImportCandidates(
+  rawText: string,
+  input: { source: string; region: string; clauses: Clause[]; fileName?: string }
+): SignalImportCandidate[] {
+  const normalized = normalizeBulkSignalText(rawText, input.fileName || "");
+  const lines = normalized
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter((line) => line.length >= 6 && !isSignalImportHeader(line));
+
+  return lines
+    .map((line, index) => {
+      const text = pickSignalImportText(line);
+      const match = compareStandardText(text, input.clauses);
+      const confidenceParts: SignalImportConfidenceParts = {
+        relevance: Math.min(35, Math.round(match.similarity * 0.35)),
+        completeness: Math.min(25, 12 + (text.length >= 24 ? 5 : 0) + (/(群众|申请人|用户|窗口|大厅|平台)/.test(text) ? 4 : 0) + (/(材料|流程|评价|投诉|目录|安全|排队|补正)/.test(text) ? 4 : 0)),
+        comparability: Math.min(20, 10 + match.overlap.length * 3 + (match.clause.dimension && text.includes(match.clause.dimension) ? 3 : 0)),
+        dataQuality: signalDataQualityScore(text),
+      };
+      const confidence = Math.min(
+        98,
+        confidenceParts.relevance + confidenceParts.completeness + confidenceParts.comparability + confidenceParts.dataQuality
+      );
+      return {
+        candidateId: `SI-${String(index + 1).padStart(3, "0")}`,
+        source: input.source,
+        region: input.region,
+        type: `解析导入-${input.source}`,
+        text,
+        confidence,
+        confidenceParts,
+        matchedClauseId: match.clause.id,
+        matchedClauseSource: match.clause.source,
+        evaluationText: `可用于标准条款比对：命中 ${match.clause.id}，相似度 ${match.similarity}%，${match.conclusion}`,
+        reviewStatus: "待导入确认",
+      };
+    })
+    .filter((item) => item.text.length >= 6);
 }
 
 export type VerificationPointStatus = "pending" | "accepted" | "rejected";
@@ -986,8 +1191,4 @@ export function normalizeBulkSignalText(rawText: string, fileName = ""): string 
     .map((item) => item.trim())
     .filter(Boolean)
     .join("\n");
-}
-
-export function runSearchSimulation(keyword: string): string[] {
-  return SEARCH_SAMPLES.slice(0, 3).map((item) => `${keyword}｜${item}`);
 }

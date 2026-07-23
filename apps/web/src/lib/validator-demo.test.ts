@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   AGENT_LOG_PLAYBACK_DELAY_MS,
   INITIAL_CLAUSES,
+  INITIAL_SIGNALS,
   beginAgentExecutionRun,
   buildAgentExecutionLog,
   buildAgentExecutionTrace,
@@ -11,19 +12,55 @@ import {
   buildFormattedVerificationReport,
   buildKeyVerificationPoints,
   buildKnowledgeCatalogSearchTasks,
+  buildKnowledgeFileAutoSlices,
   buildKnowledgeFileAsset,
+  buildSignalImportCandidates,
+  filterVectorKnowledgeClauses,
   isReadableDraftAttachment,
   isServerParsedDraftAttachment,
   isServerParsedKnowledgeAttachment,
+  knowledgeClauseKey,
   normalizeDraftAttachmentText,
   normalizeParsedDraftText,
+  nextKnowledgeVectorBuildStep,
   recordKnowledgeFileUsage,
+  resetSignalSamplesForRetest,
   runDocumentValidation,
   sliceDraftTextForReview,
   sliceKnowledgeText,
   updateKnowledgeVectorBuild,
   verificationPointsAllConfirmed,
 } from "./validator-demo.ts";
+
+test("resetSignalSamplesForRetest clears imported signal samples and selected index", () => {
+  const reset = resetSignalSamplesForRetest(INITIAL_SIGNALS, 3);
+
+  assert.deepEqual(reset, { signals: [], selectedSignalIndex: 0 });
+});
+
+test("buildSignalImportCandidates extracts comparable signal data with multi-part confidence", () => {
+  const candidates = buildSignalImportCandidates(
+    `序号,来源,反馈内容,办理环节
+1,问卷,群众反映线上预审通过后窗口仍要求重复提交纸质材料，且没有一次性说清补正材料。,窗口受理
+2,热线,大厅排队时间长，叫号屏无法判断办理窗口。,现场服务`,
+    {
+      source: "问卷调研",
+      region: "杭州市",
+      clauses: INITIAL_CLAUSES,
+    }
+  );
+
+  assert.equal(candidates.length, 2);
+  assert.equal(candidates[0].source, "问卷调研");
+  assert.equal(candidates[0].region, "杭州市");
+  assert.equal(candidates[0].type, "解析导入-问卷调研");
+  assert.ok(candidates[0].text.includes("重复提交纸质材料"));
+  assert.equal(candidates[0].matchedClauseId, "YC-8.3");
+  assert.ok(candidates[0].confidence >= 80);
+  assert.deepEqual(Object.keys(candidates[0].confidenceParts), ["relevance", "completeness", "comparability", "dataQuality"]);
+  assert.ok(candidates[0].evaluationText.includes("可用于标准条款比对"));
+  assert.equal(candidates[1].reviewStatus, "待导入确认");
+});
 
 test("beginAgentExecutionRun keeps the active run id valid for playback", () => {
   const run = beginAgentExecutionRun(7);
@@ -124,6 +161,104 @@ test("knowledge file assets track vector progress, logs, access count, and call 
   assert.equal(used.accessCount, 1);
   assert.equal(used.callCount, 1);
   assert.equal(used.lastCalledAt, "2026-07-21 10:50");
+});
+
+test("nextKnowledgeVectorBuildStep advances in-progress knowledge files and records logs", () => {
+  const asset = buildKnowledgeFileAsset({
+    name: "GBZ 24294.3-2017.pdf",
+    sourceType: "web",
+    sourceLabel: "互联网检索",
+    addedAt: "2026-07-22 17:36:57",
+    sliceCount: 23,
+    vectorProgress: 35,
+  });
+
+  const chunked = nextKnowledgeVectorBuildStep(asset, "2026-07-22 17:37:01");
+  assert.equal(chunked.vectorProgress > asset.vectorProgress, true);
+  assert.equal(chunked.vectorStatus, "构建中");
+  assert.equal(chunked.vectorLogs.at(-1)?.includes(`${chunked.vectorProgress}%`), true);
+
+  const completed = nextKnowledgeVectorBuildStep(chunked, "2026-07-22 17:37:05", 100);
+  assert.equal(completed.vectorProgress, 100);
+  assert.equal(completed.vectorStatus, "已完成");
+  assert.equal(completed.vectorLogs.at(-1)?.includes("向量索引构建完成"), true);
+});
+
+test("filterVectorKnowledgeClauses only shows completed vector clauses and supports semantic and dimension filters", () => {
+  const completedAsset = buildKnowledgeFileAsset({
+    name: "completed.pdf",
+    sourceType: "upload",
+    sourceLabel: "初始化样例",
+    addedAt: "2026-07-21 09:10",
+    sliceCount: INITIAL_CLAUSES.length,
+    vectorProgress: 100,
+  });
+  const buildingAsset = buildKnowledgeFileAsset({
+    name: "building.pdf",
+    sourceType: "web",
+    sourceLabel: "互联网检索",
+    addedAt: "2026-07-22 17:36:57",
+    sliceCount: 1,
+    vectorProgress: 55,
+  });
+  const buildingClause = {
+    id: "TMP-1",
+    source: "未完成标准",
+    dimension: "安全" as const,
+    constraint: "应" as const,
+    text: "敏感数据应完成脱敏处理。",
+    keywords: ["敏感", "安全", "脱敏"],
+  };
+  const clauseAssetIds = Object.fromEntries(INITIAL_CLAUSES.map((clause) => [knowledgeClauseKey(clause), completedAsset.id]));
+  clauseAssetIds[knowledgeClauseKey(buildingClause)] = buildingAsset.id;
+
+  const allCompleted = filterVectorKnowledgeClauses({
+    clauses: INITIAL_CLAUSES.concat(buildingClause),
+    knowledgeFiles: [completedAsset, buildingAsset],
+    clauseAssetIds,
+    query: "",
+    dimension: "全部",
+  });
+  assert.equal(allCompleted.length, INITIAL_CLAUSES.length);
+
+  const materialHits = filterVectorKnowledgeClauses({
+    clauses: INITIAL_CLAUSES.concat(buildingClause),
+    knowledgeFiles: [completedAsset, buildingAsset],
+    clauseAssetIds,
+    query: "材料补正一次性告知要求",
+    dimension: "材料",
+  });
+  assert.deepEqual(materialHits.map((clause) => clause.id), ["YC-8.3"]);
+
+  const unfinishedHits = filterVectorKnowledgeClauses({
+    clauses: INITIAL_CLAUSES.concat(buildingClause),
+    knowledgeFiles: [completedAsset, buildingAsset],
+    clauseAssetIds,
+    query: "未完成标准",
+    dimension: "安全",
+  });
+  assert.equal(unfinishedHits.length, 0);
+});
+
+test("buildKnowledgeFileAutoSlices creates clause slices for web-acquired knowledge files", () => {
+  const asset = buildKnowledgeFileAsset({
+    name: "GBT+25056-2018.pdf",
+    sourceType: "web",
+    sourceLabel: "互联网检索",
+    addedAt: "2026-07-22 19:18:40",
+    sliceCount: 0,
+    vectorProgress: 0,
+  });
+
+  const slices = buildKnowledgeFileAutoSlices(asset, 20, 6);
+
+  assert.equal(slices.length, 6);
+  assert.equal(slices[0].source, "GBT+25056-2018");
+  assert.equal(slices[0].id, "WEB-021");
+  assert.ok(slices.every((slice) => slice.text.includes("GBT+25056-2018")));
+  assert.equal(new Set(slices.map((slice) => knowledgeClauseKey(slice))).size, slices.length);
+  assert.ok(slices.some((slice) => slice.dimension === "材料"));
+  assert.ok(slices.some((slice) => slice.keywords.includes("检索")));
 });
 
 test("normalizeParsedDraftText cleans parser service output", () => {

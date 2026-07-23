@@ -13,12 +13,13 @@ import {
   DRAFT_SAMPLE,
   AGENT_LOG_PLAYBACK_DELAY_MS,
   INITIAL_CLAUSES,
-  INITIAL_SIGNALS,
   INTERFACE_SAMPLES,
   buildFormattedVerificationReport,
   buildKnowledgeCatalogSearchTasks,
+  buildKnowledgeFileAutoSlices,
   buildKnowledgeFileAsset,
   buildKeyVerificationPoints,
+  buildSignalImportCandidates,
   compareStandardText,
   beginAgentExecutionRun,
   buildAgentExecutionLog,
@@ -30,9 +31,12 @@ import {
   normalizeParsedDraftText,
   normalizeDraftAttachmentText,
   normalizeBulkSignalText,
+  filterVectorKnowledgeClauses,
+  knowledgeClauseKey,
+  nextKnowledgeVectorBuildStep,
   recordKnowledgeFileUsage,
+  resetSignalSamplesForRetest,
   runDocumentValidation,
-  runSearchSimulation,
   sliceDraftTextForReview,
   sliceKnowledgeText,
   updateKnowledgeVectorBuild,
@@ -45,20 +49,11 @@ import {
   type KnowledgeCatalogSearchTask,
   type KnowledgeFileAsset,
   type MatchResult,
+  type SignalImportCandidate,
   type SignalSample,
   type VerificationPointStatus,
   validateDraft,
 } from "@/lib/validator-demo";
-
-type VectorHit = {
-  chunk_id: string;
-  text: string;
-  asset_title: string;
-  slide_no: number;
-  chunk_type: string;
-  source_method: string | null;
-  score?: number;
-};
 
 type SearchSite = {
   id: string;
@@ -67,11 +62,27 @@ type SearchSite = {
   category: string;
 };
 
+type SignalCollectionResponse = {
+  ok: boolean;
+  error?: string;
+  logs?: string[];
+  samples?: Array<Omit<SignalSample, "id">>;
+};
+
 const DEFAULT_SEARCH_SITES: SearchSite[] = [
   { id: "gov-message", name: "政府网站留言", url: "https://www.gov.cn/hudong/", category: "政府网站留言" },
   { id: "zjzwfw", name: "浙江政务服务网", url: "https://www.zjzwfw.gov.cn/", category: "政务服务公开页" },
   { id: "hangzhou-gov", name: "杭州市人民政府", url: "https://www.hangzhou.gov.cn/", category: "地方政府公开页" },
 ];
+
+const INITIAL_KNOWLEDGE_FILE = buildKnowledgeFileAsset({
+  name: "GB/T 32168-2015 政务服务中心网上服务规范.pdf",
+  sourceType: "upload",
+  sourceLabel: "初始化样例",
+  addedAt: "2026-07-21 09:10",
+  sliceCount: INITIAL_CLAUSES.length,
+  vectorProgress: 100,
+});
 
 function countBy<T>(items: T[], getter: (item: T) => string) {
   return items.reduce(
@@ -147,7 +158,7 @@ export default function ValidatorConsole() {
   const { activeView, navigate } = useView();
 
   const [clauses, setClauses] = useState<Clause[]>(INITIAL_CLAUSES);
-  const [signals, setSignals] = useState<SignalSample[]>(INITIAL_SIGNALS);
+  const [signals, setSignals] = useState<SignalSample[]>([]);
   const [pendingSlices, setPendingSlices] = useState<Clause[]>([]);
   const [selectedSignalIndex, setSelectedSignalIndex] = useState(0);
 
@@ -159,17 +170,12 @@ export default function ValidatorConsole() {
   const [kbUploadStatus, setKbUploadStatus] = useState("维护状态：待上传或粘贴标准文本。");
   const [catalogInput, setCatalogInput] = useState("GBZ 24294.3-2017\nGB/T 39554.1-2020");
   const [catalogTasks, setCatalogTasks] = useState<KnowledgeCatalogSearchTask[]>([]);
-  const [knowledgeFiles, setKnowledgeFiles] = useState<KnowledgeFileAsset[]>(() => [
-    buildKnowledgeFileAsset({
-      name: "GB/T 32168-2015 政务服务中心网上服务规范.pdf",
-      sourceType: "upload",
-      sourceLabel: "初始化样例",
-      addedAt: "2026-07-21 09:10",
-      sliceCount: INITIAL_CLAUSES.length,
-      vectorProgress: 100,
-    }),
-  ]);
+  const [knowledgeFiles, setKnowledgeFiles] = useState<KnowledgeFileAsset[]>(() => [INITIAL_KNOWLEDGE_FILE]);
+  const [clauseAssetIds, setClauseAssetIds] = useState<Record<string, string>>(() =>
+    Object.fromEntries(INITIAL_CLAUSES.map((clause) => [knowledgeClauseKey(clause), INITIAL_KNOWLEDGE_FILE.id]))
+  );
   const [activeKnowledgeLogId, setActiveKnowledgeLogId] = useState("");
+  const knowledgeVectorBuildRunIds = useRef<Record<string, number>>({});
 
   const [draftText, setDraftText] = useState(DRAFT_SAMPLE);
   const [draftIssues, setDraftIssues] = useState<[string, string, string][]>(validateDraft(DRAFT_SAMPLE));
@@ -198,7 +204,7 @@ export default function ValidatorConsole() {
   const [searchRegion, setSearchRegion] = useState("杭州市");
   const [searchProgress, setSearchProgress] = useState(0);
   const [searchStatus, setSearchStatus] = useState("检索状态：待开始。");
-  const [searchLog, setSearchLog] = useState<string[]>(["待获取：系统将展示检索词生成、网页召回、抓屏取证、内容清洗和样本入库进度。"]);
+  const [searchLog, setSearchLog] = useState<string[]>(["待获取：系统将展示检索词生成、来源 URL 请求、页面元数据解析、快照固化和证据链入库进度。"]);
   const [searching, setSearching] = useState(false);
   const [searchSites, setSearchSites] = useState<SearchSite[]>(DEFAULT_SEARCH_SITES);
   const [activeSearchSiteId, setActiveSearchSiteId] = useState(DEFAULT_SEARCH_SITES[0]?.id || "");
@@ -208,19 +214,15 @@ export default function ValidatorConsole() {
   const [bulkSource, setBulkSource] = useState("问卷调研");
   const [bulkRegion, setBulkRegion] = useState("杭州市");
   const [bulkSignals, setBulkSignals] = useState("");
+  const [bulkFile, setBulkFile] = useState<File | null>(null);
+  const [bulkParsing, setBulkParsing] = useState(false);
+  const [bulkCandidates, setBulkCandidates] = useState<SignalImportCandidate[]>([]);
   const [bulkFileStatus, setBulkFileStatus] = useState(
     "文件状态：未选择文件。文本类文件可直接读取；Word、PDF、表格等由解析服务抽取正文。"
   );
   const [interfacePlatform, setInterfacePlatform] = useState("警小爱");
   const [interfaceDataType, setInterfaceDataType] = useState("咨询问答");
   const [interfaceStatus, setInterfaceStatus] = useState("接口状态：未连接。请选择平台后测试或同步数据。");
-
-  const [vectorFile, setVectorFile] = useState<File | null>(null);
-  const [vectorStatus, setVectorStatus] = useState("VLM 入库状态：未执行。");
-  const [vectorIngesting, setVectorIngesting] = useState(false);
-  const [vectorQuery, setVectorQuery] = useState("材料不齐全时线上线下是否一致");
-  const [vectorHits, setVectorHits] = useState<VectorHit[]>([]);
-  const [vectorSearching, setVectorSearching] = useState(false);
 
   const [toast, setToast] = useState("");
 
@@ -255,13 +257,26 @@ export default function ValidatorConsole() {
 
   const filteredClauses = useMemo(
     () =>
-      clauses.filter((clause) => {
-        const hitKeyword =
-          !clauseSearch.trim() || [clause.id, clause.source, clause.dimension, clause.text, clause.constraint].join(" ").includes(clauseSearch.trim());
-        const hitFilter = clauseFilter === "全部" || clause.dimension === clauseFilter;
-        return hitKeyword && hitFilter;
+      filterVectorKnowledgeClauses({
+        clauses,
+        knowledgeFiles,
+        clauseAssetIds,
+        query: clauseSearch,
+        dimension: clauseFilter,
       }),
-    [clauses, clauseSearch, clauseFilter]
+    [clauses, knowledgeFiles, clauseAssetIds, clauseSearch, clauseFilter]
+  );
+  const completedVectorFileCount = useMemo(() => knowledgeFiles.filter((file) => file.vectorStatus === "已完成").length, [knowledgeFiles]);
+  const completedVectorClauseCount = useMemo(
+    () =>
+      filterVectorKnowledgeClauses({
+        clauses,
+        knowledgeFiles,
+        clauseAssetIds,
+        query: "",
+        dimension: "全部",
+      }).length,
+    [clauses, knowledgeFiles, clauseAssetIds]
   );
 
   const issueCount = draftIssues.length;
@@ -332,6 +347,26 @@ ${effectiveMatch.issues.join("；")}
     });
   };
 
+  const startKnowledgeVectorBuild = (fileId: string, fromProgress = 0) => {
+    const runId = (knowledgeVectorBuildRunIds.current[fileId] || 0) + 1;
+    knowledgeVectorBuildRunIds.current[fileId] = runId;
+    const targets = [50, 72, 88, 100].filter((target) => target > fromProgress);
+    void (async () => {
+      for (const target of targets) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        if (knowledgeVectorBuildRunIds.current[fileId] !== runId) return;
+        setKnowledgeFiles((prev) =>
+          prev.map((item) =>
+            item.id === fileId && item.vectorStatus !== "已完成"
+              ? nextKnowledgeVectorBuildStep(item, currentKnowledgeTime(), target)
+              : item
+          )
+        );
+        if (target >= 100) showToast("知识库向量构建完成");
+      }
+    })();
+  };
+
   const onBuildCatalogSearchTasks = () => {
     const tasks = buildKnowledgeCatalogSearchTasks(catalogInput, currentKnowledgeTime()).map((task) => ({
       ...task,
@@ -376,18 +411,18 @@ ${effectiveMatch.issues.join("；")}
       sourceType: "web",
       sourceLabel: task.sourceSite,
       addedAt,
-      sliceCount: Math.max(8, Math.min(36, Math.ceil(task.fileName.length * 1.4))),
-      vectorProgress: 35,
+      sliceCount: 0,
+      vectorProgress: 0,
     });
     upsertKnowledgeFile(asset);
     setCatalogTasks((prev) =>
       prev.map((item) =>
         item.id === task.id
-          ? { ...item, matchedTitle: asset.name, message: "已加入知识文件列表，等待向量构建完成。" }
+          ? { ...item, matchedTitle: asset.name, message: "已加入知识文件列表，请先自动切分知识切片，再构建向量。" }
           : item
       )
     );
-    setKbUploadStatus(`维护状态：已通过联网检索加入 ${asset.name}，可在知识文件列表中查看构建日志。`);
+    setKbUploadStatus(`维护状态：已通过联网检索加入 ${asset.name}，请在知识文件列表中执行自动切分。`);
     showToast("已加入知识库文件列表");
   };
 
@@ -397,15 +432,52 @@ ${effectiveMatch.issues.join("；")}
     setActiveKnowledgeLogId(id);
   };
 
-  const onBuildKnowledgeVector = (id: string) => {
+  const onAutoSliceKnowledgeFile = (id: string) => {
+    const file = knowledgeFiles.find((item) => item.id === id);
+    if (!file) return;
+    const slices = buildKnowledgeFileAutoSlices(file, clauses.length);
+    setClauses((prev) => {
+      const existingKeys = new Set(prev.map((clause) => knowledgeClauseKey(clause)));
+      const freshSlices = slices.filter((slice) => !existingKeys.has(knowledgeClauseKey(slice)));
+      return freshSlices.length ? prev.concat(freshSlices) : prev;
+    });
+    setClauseAssetIds((prev) => ({
+      ...prev,
+      ...Object.fromEntries(slices.map((slice) => [knowledgeClauseKey(slice), file.id])),
+    }));
     const at = currentKnowledgeTime();
+    setKnowledgeFiles((prev) =>
+      prev.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              sliceCount: slices.length,
+              vectorLogs: item.vectorLogs.concat(`${at} 自动切分完成：生成 ${slices.length} 个条款级知识切片。`),
+            }
+          : item
+      )
+    );
+    setActiveKnowledgeLogId(id);
+    showToast(`已自动切分 ${slices.length} 个知识切片`);
+  };
+
+  const onBuildKnowledgeVector = (id: string) => {
+    const file = knowledgeFiles.find((item) => item.id === id);
+    if (file && file.sliceCount <= 0) {
+      showToast("请先自动切分知识切片");
+      return;
+    }
+    const at = currentKnowledgeTime();
+    knowledgeVectorBuildRunIds.current[id] = (knowledgeVectorBuildRunIds.current[id] || 0) + 1;
     setKnowledgeFiles((prev) => prev.map((item) => (item.id === id ? updateKnowledgeVectorBuild(item, at) : item)));
     setActiveKnowledgeLogId(id);
     showToast("向量构建日志已更新");
   };
 
   const onRemoveKnowledgeFile = (id: string) => {
+    knowledgeVectorBuildRunIds.current[id] = (knowledgeVectorBuildRunIds.current[id] || 0) + 1;
     setKnowledgeFiles((prev) => prev.filter((item) => item.id !== id));
+    setClauseAssetIds((prev) => Object.fromEntries(Object.entries(prev).filter(([, assetId]) => assetId !== id)));
     if (activeKnowledgeLogId === id) setActiveKnowledgeLogId("");
     showToast("已移除知识文件");
   };
@@ -449,17 +521,21 @@ ${effectiveMatch.issues.join("；")}
       return;
     }
     const assetName = kbFileName || `${kbSourceType}-粘贴文本`;
-    upsertKnowledgeFile(
-      buildKnowledgeFileAsset({
-        name: assetName,
-        sourceType: kbFileName ? "upload" : "upload",
-        sourceLabel: kbFileName ? "本地上传" : "手动粘贴",
-        addedAt: currentKnowledgeTime(),
-        sliceCount: pendingSlices.length,
-        vectorProgress: 55,
-      })
-    );
+    const asset = buildKnowledgeFileAsset({
+      name: assetName,
+      sourceType: kbFileName ? "upload" : "upload",
+      sourceLabel: kbFileName ? "本地上传" : "手动粘贴",
+      addedAt: currentKnowledgeTime(),
+      sliceCount: pendingSlices.length,
+      vectorProgress: 55,
+    });
+    upsertKnowledgeFile(asset);
+    startKnowledgeVectorBuild(asset.id, asset.vectorProgress);
     setClauses((prev) => prev.concat(pendingSlices));
+    setClauseAssetIds((prev) => ({
+      ...prev,
+      ...Object.fromEntries(pendingSlices.map((slice) => [knowledgeClauseKey(slice), asset.id])),
+    }));
     setKbRawText("");
     setKbFileName("");
     setPendingSlices([]);
@@ -615,7 +691,13 @@ ${effectiveMatch.issues.join("；")}
     showToast(`已读取 ${file.name}`);
   };
 
-  const appendSignal = (source: string, text: string, region = "杭州市", type = "接入样本") => {
+  const appendSignal = (
+    source: string,
+    text: string,
+    region = "杭州市",
+    type = "接入样本",
+    meta: Partial<Omit<SignalSample, "id" | "source" | "region" | "type" | "text" | "status">> = {}
+  ) => {
     setSignals((prev) => {
       const next = prev.concat({
         id: `S-${String(prev.length + 1).padStart(3, "0")}`,
@@ -624,6 +706,7 @@ ${effectiveMatch.issues.join("；")}
         type,
         text,
         status: "待复核",
+        ...meta,
       });
       setSelectedSignalIndex(next.length - 1);
       return next;
@@ -642,11 +725,11 @@ ${effectiveMatch.issues.join("；")}
     setSearchLog([`0% 已创建检索任务：${searchKeyword} / ${searchScope}${activeSearchSite ? ` / ${activeSearchSite.name}` : ""}`]);
     const steps: [number, string, string][] = [
       [14, "生成检索词", "AI 扩展同义词、事项名称和群众表达方式。"],
-      [31, "公开网页召回", `调用${activeSearchSite ? activeSearchSite.name : "搜索引擎"}召回政府网站留言、新闻公开页和问政平台线索。`],
-      [48, "自动化搜索抓屏", "模拟打开结果页、截取页面证据并记录来源时间。"],
+      [31, "来源 URL 请求", `调用${activeSearchSite ? activeSearchSite.name : "维护网址"}获取公开网页原始响应。`],
+      [48, "页面证据固化", "解析页面标题、发布时间，生成 HTML 快照并记录采集时间。"],
       [66, "内容清洗去重", "过滤重复片段、广告内容和非政务服务相关信息。"],
       [82, "舆情语义抽取", "抽取问题对象、办理环节、群众诉求和风险标签。"],
-      [100, "样本入库完成", "生成公开网络舆情样本，保留检索主题和抓屏来源。"],
+      [100, "样本入库完成", "生成公开网络舆情样本，保留来源 URL、页面标题、发布时间、快照和证据链。"],
     ];
     for (const [percent, status, line] of steps) {
       await new Promise((resolve) => setTimeout(resolve, 420));
@@ -654,14 +737,69 @@ ${effectiveMatch.issues.join("；")}
       setSearchStatus(`检索状态：${status}`);
       setSearchLog((prev) => prev.concat(`${percent}% ${line}`));
     }
-    runSearchSimulation(searchKeyword).forEach((item) =>
-      appendSignal(activeSearchSite ? activeSearchSite.name : "AI检索抓屏", item, searchRegion, `公开网络-${searchScope}`)
-    );
-    setSearching(false);
-    showToast("已获取 3 条公开网络舆情样本");
+    try {
+      const sites = activeSearchSite ? [activeSearchSite] : searchSites;
+      const response = await fetch("/api/signals/collect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          keyword: searchKeyword,
+          region: searchRegion,
+          scope: searchScope,
+          sites,
+        }),
+      });
+      const data = (await response.json()) as SignalCollectionResponse;
+      if (!response.ok || !data.ok) throw new Error(data.error || "真实采集失败");
+      const samples = data.samples || [];
+      if (!samples.length) throw new Error("未从来源 URL 中抽取到可入库样本");
+      setSignals((prev) => {
+        const next = prev.concat(
+          samples.map((item, index) => ({
+            ...item,
+            id: `S-${String(prev.length + index + 1).padStart(3, "0")}`,
+          }))
+        );
+        setSelectedSignalIndex(next.length - 1);
+        return next;
+      });
+      setSearchProgress(100);
+      setSearchStatus(`检索状态：真实采集完成，已生成 ${samples.length} 条带证据链样本`);
+      setSearchLog((prev) =>
+        prev.concat(data.logs || []).concat(
+          samples.map((item) => `100% 已入库：${item.pageTitle || item.source} / ${item.sourceUrl || "来源 URL 未返回"}`)
+        )
+      );
+      showToast(`已真实采集 ${samples.length} 条样本`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSearchStatus(`检索状态：真实采集失败 - ${message}`);
+      setSearchLog((prev) => prev.concat(`采集失败：${message}`));
+      showToast("真实采集失败，请检查来源 URL");
+    } finally {
+      setSearching(false);
+    }
   };
 
   const onImportBulkSignals = () => {
+    if (bulkCandidates.length) {
+      bulkCandidates.forEach((candidate) =>
+        appendSignal(candidate.source, candidate.text, candidate.region, candidate.type, {
+          confidence: candidate.confidence,
+          confidenceParts: candidate.confidenceParts,
+          matchedClauseId: candidate.matchedClauseId,
+          matchedClauseSource: candidate.matchedClauseSource,
+          evaluationText: candidate.evaluationText,
+          reviewStatus: candidate.reviewStatus,
+          evidenceStatus: "imported",
+        })
+      );
+      setBulkSignals("");
+      setBulkCandidates([]);
+      setBulkFileStatus(`文件状态：已完成 ${bulkCandidates.length} 条解析样本导入，置信度和命中条款已随样本留痕。`);
+      showToast(`已导入 ${bulkCandidates.length} 条解析样本`);
+      return;
+    }
     const lines = normalizeBulkSignalText(bulkSignals)
       .split(/\n+/)
       .map((item) => item.trim())
@@ -672,26 +810,86 @@ ${effectiveMatch.issues.join("；")}
     }
     lines.forEach((line) => appendSignal(bulkSource, line, bulkRegion, "批量导入"));
     setBulkSignals("");
+    setBulkCandidates([]);
     setBulkFileStatus(`文件状态：已完成 ${lines.length} 条样本导入，来源已按“${bulkSource} / ${bulkRegion}”留痕。`);
     showToast(`已批量导入 ${lines.length} 条样本`);
   };
 
+  const onClearSignalSamples = () => {
+    const reset = resetSignalSamplesForRetest(signals, selectedSignalIndex);
+    setSignals(reset.signals);
+    setSelectedSignalIndex(reset.selectedSignalIndex);
+    setBulkSignals("");
+    setBulkCandidates([]);
+    setBulkFile(null);
+    setBulkParsing(false);
+    setBulkFileStatus("文件状态：已清空舆情与调研样本，可重新选择文件并一键解析。");
+    showToast("已清空舆情与调研样本");
+  };
+
   const onBulkFileChange = async (file: File | undefined) => {
     if (!file) return;
+    setBulkFile(file);
+    setBulkCandidates([]);
     const textLike = /\.(txt|md|markdown|csv|tsv|json|xml|html|htm|log)$/i.test(file.name);
     if (!textLike) {
+      setBulkSignals("");
       setBulkFileStatus(
-        `文件状态：已选择 ${file.name}。当前格式需解析服务处理，可先将正文粘贴到文本框导入。`
+        `文件状态：已选择 ${file.name}。请点击“一键解析”抽取候选样本并生成置信度评定。`
       );
-      showToast("已选择文件，当前格式需解析服务处理");
+      showToast("已选择文件，可一键解析");
       return;
     }
     const raw = await file.text();
     const normalized = normalizeBulkSignalText(raw, file.name);
     setBulkSignals(normalized);
     const lines = normalized.split(/\n+/).filter(Boolean).length;
-    setBulkFileStatus(`文件状态：已读取 ${file.name}，识别 ${lines} 条候选样本，可校对后点击批量导入。`);
+    setBulkFileStatus(`文件状态：已读取 ${file.name}，识别 ${lines} 条文本行。建议点击“一键解析”生成置信度和条款命中结果。`);
     showToast(`已读取 ${lines} 条候选样本`);
+  };
+
+  const onParseBulkSignals = async () => {
+    if (!bulkFile && !bulkSignals.trim()) {
+      showToast("请先选择文件或粘贴样本文本");
+      return;
+    }
+    setBulkParsing(true);
+    setBulkCandidates([]);
+    try {
+      let parsedText = bulkSignals;
+      let parserName = "local-text";
+      const fileName = bulkFile?.name || "粘贴样本.txt";
+      if (bulkFile && !parsedText.trim()) {
+        const form = new FormData();
+        form.append("file", bulkFile);
+        const useDocumentParser = /\.(doc|docx|pdf)$/i.test(bulkFile.name);
+        const response = await fetch(useDocumentParser ? "/api/text/extract" : "/api/signals/parse-file", {
+          method: "POST",
+          body: form,
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "文件解析失败");
+        parsedText = normalizeBulkSignalText(String(data.text || ""), fileName);
+        parserName = data.parser || (useDocumentParser ? "document-parser" : "signal-parser");
+        setBulkSignals(parsedText);
+      }
+      const candidates = buildSignalImportCandidates(parsedText, {
+        source: bulkSource,
+        region: bulkRegion,
+        clauses,
+        fileName,
+      });
+      if (!candidates.length) throw new Error("未解析出可用于条款比对的样本数据");
+      setBulkCandidates(candidates);
+      setBulkFileStatus(`文件状态：一键解析完成，解析器 ${parserName}，生成 ${candidates.length} 条候选样本；已按相关性、完整性、可比对性、数据质量评定置信度。`);
+      showToast(`已解析 ${candidates.length} 条候选样本`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setBulkFileStatus(`文件状态：一键解析失败。${message}`);
+      showToast("样本解析失败");
+    } finally {
+      setBulkParsing(false);
+    }
   };
 
   const onOpenSearchSite = (site: SearchSite) => {
@@ -771,7 +969,10 @@ ${effectiveMatch.issues.join("；")}
 
   const onReset = () => {
     setClauses(INITIAL_CLAUSES);
-    setSignals(INITIAL_SIGNALS);
+    setKnowledgeFiles([INITIAL_KNOWLEDGE_FILE]);
+    setClauseAssetIds(Object.fromEntries(INITIAL_CLAUSES.map((clause) => [knowledgeClauseKey(clause), INITIAL_KNOWLEDGE_FILE.id])));
+    knowledgeVectorBuildRunIds.current = {};
+    setSignals([]);
     setSelectedSignalIndex(0);
     setPendingSlices([]);
     setKbRawText("");
@@ -792,8 +993,11 @@ ${effectiveMatch.issues.join("；")}
     setReportCount(0);
     setVerificationPointStatuses({});
     setFormattedReportText("");
-    setVectorHits([]);
-    setVectorStatus("VLM 入库状态：未执行。");
+    setBulkFile(null);
+    setBulkSignals("");
+    setBulkCandidates([]);
+    setBulkParsing(false);
+    setBulkFileStatus("文件状态：未选择文件。文本类文件可直接读取；Word、PDF、表格等由解析服务抽取正文。");
     navigate("overview");
     showToast("已重置");
   };
@@ -843,66 +1047,6 @@ ${effectiveMatch.issues.join("；")}
     link.remove();
     URL.revokeObjectURL(url);
     showToast("报告文档已导出");
-  };
-
-  const onVectorIngest = async () => {
-    if (!vectorFile) {
-      showToast("请先选择标准文档文件");
-      return;
-    }
-    setVectorIngesting(true);
-    setVectorStatus("VLM 入库状态：解析中，请稍候...");
-    try {
-      const form = new FormData();
-      form.append("file", vectorFile);
-      form.append("title", vectorFile.name.replace(/\.[^.]+$/, ""));
-      const res = await fetch("/api/vector/ingest-file", { method: "POST", body: form });
-      const data = await res.json();
-      if (!res.ok || !data.ok) throw new Error(data.error || "入库失败");
-      upsertKnowledgeFile(
-        buildKnowledgeFileAsset({
-          name: vectorFile.name,
-          sourceType: "upload",
-          sourceLabel: "VLM 解析入库",
-          addedAt: currentKnowledgeTime(),
-          sliceCount: data?.embed?.embedded || data?.parsed?.pages || 0,
-          vectorProgress: 100,
-        })
-      );
-      setVectorStatus(
-        `VLM 入库状态：完成。解析 ${data?.parsed?.pages || 0} 页，补全向量 ${data?.embed?.embedded || 0} 条。`
-      );
-      showToast("VLM 解析与向量入库完成");
-    } catch (error) {
-      setVectorStatus(`VLM 入库状态：失败。${String(error)}`);
-      showToast("VLM 入库失败");
-    } finally {
-      setVectorIngesting(false);
-    }
-  };
-
-  const onVectorSearch = async () => {
-    if (!vectorQuery.trim()) {
-      showToast("请输入语义检索问题");
-      return;
-    }
-    setVectorSearching(true);
-    try {
-      const res = await fetch("/api/vector/search", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: vectorQuery, k: 6 }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "检索失败");
-      setVectorHits((data.hits || []) as VectorHit[]);
-      setKnowledgeFiles((prev) => prev.map((item) => (item.vectorStatus === "已完成" ? recordKnowledgeFileUsage(item, "call", currentKnowledgeTime()) : item)));
-      showToast(`已返回 ${(data.hits || []).length} 条结果`);
-    } catch (error) {
-      showToast(String(error));
-    } finally {
-      setVectorSearching(false);
-    }
   };
 
   const displayedAgentTrace: AgentExecutionLogLine[] =
@@ -1306,6 +1450,10 @@ ${effectiveMatch.issues.join("；")}
                               <Eye className="h-4 w-4" />
                               查看
                             </Button>
+                            <Button variant="outline" onClick={() => onAutoSliceKnowledgeFile(file.id)} disabled={file.sliceCount > 0}>
+                              <FileSearch className="h-4 w-4" />
+                              {file.sliceCount > 0 ? "已切分" : "自动切分"}
+                            </Button>
                             <Button variant="outline" onClick={() => onBuildKnowledgeVector(file.id)}>
                               构建向量
                             </Button>
@@ -1383,55 +1531,8 @@ ${effectiveMatch.issues.join("；")}
             )}
           </div>
 
-          <div className="gov-soft-panel space-y-3 rounded-lg p-4">
-            <h3 className="font-medium">VLM 文档解析与向量检索（SalesPilot 核心能力）</h3>
-            <div className="grid gap-2 lg:grid-cols-[1fr_auto_auto]">
-              <input
-                className="gov-file-input block h-9 w-full rounded-lg px-3 py-1 text-sm"
-                type="file"
-                accept=".ppt,.pptx,.pdf,.doc,.docx"
-                onChange={(e) => setVectorFile(e.target.files?.[0] || null)}
-              />
-              <Button variant="outline" onClick={onVectorIngest} disabled={vectorIngesting}>
-                {vectorIngesting ? <Loader2 className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}
-                VLM解析入库
-              </Button>
-              <Button
-                variant="ghost"
-                onClick={async () => {
-                  const res = await fetch("/api/vector/embed-missing", { method: "POST" });
-                  const data = await res.json();
-                  setVectorStatus(`向量补全完成：${data.embedded || 0} 条。`);
-                  showToast("已执行向量补全");
-                }}
-              >
-                补全缺失向量
-              </Button>
-            </div>
-            <div className="grid gap-2 lg:grid-cols-[1fr_auto]">
-              <Input value={vectorQuery} onChange={(e) => setVectorQuery(e.target.value)} placeholder="输入语义检索问题，例如：材料补正一次性告知要求" />
-              <Button variant="primary" onClick={onVectorSearch} disabled={vectorSearching}>
-                {vectorSearching ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
-                语义检索
-              </Button>
-            </div>
-            <p className="text-xs text-muted-foreground">{vectorStatus}</p>
-            {!!vectorHits.length && (
-              <div className="space-y-2">
-                {vectorHits.map((hit) => (
-                  <div key={hit.chunk_id} className="rounded-md border border-border p-2 text-sm">
-                    <div className="font-medium">
-                      {hit.asset_title} · 第 {hit.slide_no} 页 · {hit.chunk_type}
-                    </div>
-                    <p className="mt-1 text-muted-foreground">{hit.text.slice(0, 180)}{hit.text.length > 180 ? "..." : ""}</p>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
           <div className="grid gap-2 lg:grid-cols-2">
-            <Input value={clauseSearch} onChange={(e) => setClauseSearch(e.target.value)} placeholder="检索条款、事项、材料、目录、安全、评价等关键词" />
+            <Input value={clauseSearch} onChange={(e) => setClauseSearch(e.target.value)} placeholder="语义检索已构建向量条款，例如：材料补正一次性告知要求" />
             <select className="gov-input h-9 rounded-lg px-3 text-sm outline-none" value={clauseFilter} onChange={(e) => setClauseFilter(e.target.value)}>
               {["全部", "流程", "材料", "资源", "安全", "评价"].map((item) => (
                 <option key={item} value={item}>
@@ -1439,6 +1540,10 @@ ${effectiveMatch.issues.join("；")}
                 </option>
               ))}
             </select>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#d8e9f7] bg-white/72 px-3 py-2 text-xs text-muted-foreground">
+            <span>已完成向量知识库：{completedVectorFileCount} 个文件，形成 {completedVectorClauseCount} 条条款切片。</span>
+            <span>当前筛选显示：{filteredClauses.length} 条</span>
           </div>
           <div className="gov-scrollbar overflow-auto rounded-lg border border-[#d8e9f7] bg-white/80">
             <table className="w-full min-w-[860px] text-left text-sm">
@@ -1452,15 +1557,23 @@ ${effectiveMatch.issues.join("；")}
                 </tr>
               </thead>
               <tbody>
-                {filteredClauses.map((clause) => (
-                  <tr key={clause.id} className="border-t border-[#e4f0f8] align-top hover:bg-[#f7fcff]">
-                    <td className="px-3 py-2 font-medium">{clause.id}</td>
-                    <td className="px-3 py-2">{clause.source}</td>
-                    <td className="px-3 py-2">{clause.dimension}</td>
-                    <td className="px-3 py-2 text-muted-foreground">{clause.text}</td>
-                    <td className="px-3 py-2">{clause.constraint}</td>
+                {filteredClauses.length ? (
+                  filteredClauses.map((clause) => (
+                    <tr key={clause.id} className="border-t border-[#e4f0f8] align-top hover:bg-[#f7fcff]">
+                      <td className="px-3 py-2 font-medium">{clause.id}</td>
+                      <td className="px-3 py-2">{clause.source}</td>
+                      <td className="px-3 py-2">{clause.dimension}</td>
+                      <td className="px-3 py-2 text-muted-foreground">{clause.text}</td>
+                      <td className="px-3 py-2">{clause.constraint}</td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr className="border-t border-[#e4f0f8]">
+                    <td className="px-3 py-6 text-center text-sm text-muted-foreground" colSpan={5}>
+                      暂无符合条件的已构建向量条款。请确认知识文件向量进度已完成，或调整语义检索词和维度。
+                    </td>
                   </tr>
-                ))}
+                )}
               </tbody>
             </table>
           </div>
@@ -1662,19 +1775,79 @@ ${effectiveMatch.issues.join("；")}
           <Card className="space-y-3">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold">舆情与调研样本</h2>
-              <Badge variant="info">{signals.length} 条</Badge>
+              <div className="flex items-center gap-2">
+                <Badge variant="info">{signals.length} 条</Badge>
+                <Button type="button" variant="outline" size="sm" onClick={onClearSignalSamples} disabled={!signals.length && !bulkSignals && !bulkCandidates.length}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                  清空样本
+                </Button>
+              </div>
             </div>
             <div className="space-y-2">
               {signals.map((signal, index) => (
-                <button
-                  type="button"
+                <div
+                  role="button"
+                  tabIndex={0}
                   key={signal.id}
                   className={`w-full rounded-lg border px-3 py-3 text-left text-sm transition-all ${selectedSignalIndex === index ? "border-primary bg-[#edf8ff] shadow-[0_10px_24px_rgba(22,141,243,0.10)]" : "border-[#d8e9f7] bg-white/72 hover:bg-[#f7fcff]"}`}
                   onClick={() => setSelectedSignalIndex(index)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") setSelectedSignalIndex(index);
+                  }}
                 >
-                  <div className="font-medium">{signal.id} · {signal.source} · {signal.region}</div>
+                  <div className="flex flex-wrap items-center gap-2 font-medium">
+                    <span>{signal.id} · {signal.source} · {signal.region}</span>
+                      {signal.evidenceStatus === "real_collected" && <Badge variant="success">真实采集</Badge>}
+                    {signal.evidenceStatus === "imported" && <Badge variant="info">解析导入</Badge>}
+                  </div>
                   <p className="mt-1 text-muted-foreground">{signal.text}</p>
-                </button>
+                  {(signal.confidence || signal.matchedClauseId || signal.evaluationText) && (
+                    <div className="mt-2 grid gap-1 rounded-md border border-[#d8e9f7] bg-white/70 p-2 text-xs text-[#49657e]">
+                      {signal.confidence && <div><b>置信度：</b>{signal.confidence} 分</div>}
+                      {signal.confidenceParts && (
+                        <div>
+                          <b>分项：</b>相关性 {signal.confidenceParts.relevance} / 完整性 {signal.confidenceParts.completeness} / 可比对性 {signal.confidenceParts.comparability} / 数据质量 {signal.confidenceParts.dataQuality}
+                        </div>
+                      )}
+                      {signal.matchedClauseId && <div><b>命中条款：</b>{signal.matchedClauseSource} / {signal.matchedClauseId}</div>}
+                      {signal.evaluationText && <div><b>评价数据：</b>{signal.evaluationText}</div>}
+                    </div>
+                  )}
+                  {(signal.sourceUrl || signal.pageTitle || signal.publishedAt || signal.capturedAt) && (
+                    <div className="mt-2 grid gap-1 rounded-md border border-[#d8e9f7] bg-white/70 p-2 text-xs text-[#49657e]">
+                      {signal.pageTitle && <div><b>页面标题：</b>{signal.pageTitle}</div>}
+                      {signal.publishedAt && <div><b>发布时间：</b>{signal.publishedAt}</div>}
+                      {signal.capturedAt && <div><b>采集时间：</b>{signal.capturedAt}</div>}
+                      {signal.sourceUrl && <div className="truncate"><b>来源 URL：</b>{signal.sourceUrl}</div>}
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        {signal.sourceUrl && (
+                          <Button type="button" variant="outline" size="sm" onClick={(event) => { event.stopPropagation(); window.open(signal.sourceUrl, "_blank", "noopener,noreferrer"); }}>
+                            <ExternalLink className="h-3.5 w-3.5" />
+                            来源页
+                          </Button>
+                        )}
+                        {signal.snapshotUrl && (
+                          <Button type="button" variant="ghost" size="sm" onClick={(event) => { event.stopPropagation(); window.open(signal.snapshotUrl, "_blank", "noopener,noreferrer"); }}>
+                            <Eye className="h-3.5 w-3.5" />
+                            快照
+                          </Button>
+                        )}
+                      </div>
+                      {signal.evidenceChain?.length ? (
+                        <details className="pt-1" onClick={(event) => event.stopPropagation()}>
+                          <summary className="cursor-pointer font-medium text-[#075ec9]">证据链 {signal.evidenceChain.length} 步</summary>
+                          <div className="mt-1 space-y-1">
+                            {signal.evidenceChain.map((item) => (
+                              <div key={`${signal.id}-${item.stage}`} className="rounded bg-[#f7fcff] px-2 py-1">
+                                {item.at} · {item.label}：{item.detail}
+                              </div>
+                            ))}
+                          </div>
+                        </details>
+                      ) : null}
+                    </div>
+                  )}
+                </div>
               ))}
             </div>
           </Card>
@@ -1778,7 +1951,39 @@ ${effectiveMatch.issues.join("；")}
               />
               <p className="text-xs text-muted-foreground">{bulkFileStatus}</p>
               <textarea className="gov-input min-h-28 w-full rounded-lg p-3 text-sm outline-none" value={bulkSignals} onChange={(e) => setBulkSignals(e.target.value)} />
-              <Button variant="outline" onClick={onImportBulkSignals}>批量导入样本</Button>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="primary" onClick={onParseBulkSignals} disabled={bulkParsing}>
+                  {bulkParsing ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSearch className="h-4 w-4" />}
+                  一键解析
+                </Button>
+                <Button variant="outline" onClick={onImportBulkSignals}>批量导入样本</Button>
+              </div>
+              {!!bulkCandidates.length && (
+                <div className="space-y-2 rounded-lg border border-[#cfe4f5] bg-white/72 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h4 className="text-sm font-semibold text-[#14304f]">解析候选样本</h4>
+                    <Badge variant="success">{bulkCandidates.length} 条</Badge>
+                  </div>
+                  <div className="gov-scrollbar max-h-60 space-y-2 overflow-auto pr-1">
+                    {bulkCandidates.map((candidate) => (
+                      <div key={candidate.candidateId} className="rounded-lg border border-[#d8e9f7] bg-[#f7fcff] p-2 text-xs text-[#49657e]">
+                        <div className="flex flex-wrap items-center gap-2 font-semibold text-[#14304f]">
+                          <span>{candidate.candidateId}</span>
+                          <Badge variant={candidate.confidence >= 85 ? "success" : candidate.confidence >= 70 ? "warning" : "danger"}>
+                            {candidate.confidence} 分
+                          </Badge>
+                          <span>{candidate.matchedClauseId}</span>
+                        </div>
+                        <p className="mt-1 text-sm text-[#14304f]">{candidate.text}</p>
+                        <div className="mt-1">
+                          相关性 {candidate.confidenceParts.relevance} / 完整性 {candidate.confidenceParts.completeness} / 可比对性 {candidate.confidenceParts.comparability} / 数据质量 {candidate.confidenceParts.dataQuality}
+                        </div>
+                        <div className="mt-1">{candidate.evaluationText}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="gov-soft-panel space-y-3 rounded-lg p-4">
