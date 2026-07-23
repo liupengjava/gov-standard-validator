@@ -56,6 +56,23 @@ export function resetSignalSamplesForRetest(_signals: SignalSample[], _selectedS
   return { signals: [], selectedSignalIndex: 0 };
 }
 
+export type PersistentSearchSite = {
+  id: string;
+  name: string;
+  url: string;
+  category: string;
+};
+
+export function mergePersistentSearchSites<T extends PersistentSearchSite>(defaults: T[], persisted: T[]): T[] {
+  const seen = new Set<string>();
+  return defaults.concat(persisted).filter((site) => {
+    const key = site.url.trim().replace(/\/+$/, "").toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 export const CLAUSE_SAMPLE =
   "材料不齐全时，窗口可以告知申请人补正材料；线上预审结果可供窗口参考，线下受理人员根据实际情况决定是否再次收取纸质材料。";
 
@@ -851,33 +868,110 @@ export function buildFormattedVerificationReport({
   points: KeyVerificationPoint[];
 }): string {
   const confirmed = verificationPointsAllConfirmed(points) ? "专家确认完成" : "专家确认未完成";
+  const riskCounts = points.reduce(
+    (acc, point) => {
+      const key = point.riskLabel.includes("高") ? "高风险" : point.riskLabel.includes("中") ? "中风险" : "低风险";
+      acc[key] += 1;
+      return acc;
+    },
+    { 高风险: 0, 中风险: 0, 低风险: 0 }
+  );
+  const reportDate = new Date().toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" });
+  const riskSummaryRows = [
+    "等级｜数量｜主要领域｜处置建议",
+    `高风险｜${riskCounts["高风险"]}｜强制性要求、数据安全、执行冲突、上位依据｜发布前实质修订并组织业务、法制、数据安全专家复核`,
+    `中风险｜${riskCounts["中风险"]}｜程序细化、责任主体、证据留痕、评价闭环｜完善为可检查、可留痕、可追溯条款`,
+    `低风险｜${riskCounts["低风险"]}｜术语、格式、表达和补充说明｜随编辑性统一处理`,
+  ].join("\n");
+  const directions = [
+    `方向1：围绕“${match.clause.dimension}”维度补齐责任主体、执行条件和验收口径，避免条款只给原则不便检查。`,
+    `方向2：对命中条款 ${match.clause.id} 涉及的关键词（${match.overlap.slice(0, 5).join("、") || match.clause.dimension}）补充证据依据和留痕方式。`,
+    "方向3：对高风险项优先开展专家复核，明确采纳意见、拒绝意见和后续修订责任人。",
+    "方向4：将报告中的问题索引表、证据清单和验证限制同步纳入正式送审材料，便于复核追踪。",
+  ].join("\n");
   const pointSections = points
     .map((point, index) => {
       const decision = point.status === "accepted" ? "采纳意见" : point.status === "rejected" ? "拒绝意见" : "待确认";
-      return `${index + 1}. ${point.title}
-确认结果：${decision}
-风险等级：${point.riskLabel}
-原文位置：${point.originalLocation}
+      const issueId = `V-${String(index + 1).padStart(3, "0")}`;
+      return `${issueId}｜${point.locator}｜${point.riskLabel}｜${point.title}
+原文定位：${point.originalLocation || point.locator}
 问题判断：${point.problemJudgment}
-标准依据：${point.references}
-证据摘录：${point.evidence}
-修订建议：${point.revisionAdvice}`;
+修改建议：${point.revisionAdvice}
+建议文本：${point.suggestedText}
+依据：${point.references}；${point.evidence}
+置信度：${point.confidence}分；人工复核状态：${point.reviewStatus}；专家确认结果：${decision}。`;
     })
     .join("\n\n");
+  const indexRows = [
+    "编号｜条款｜风险｜问题标签｜主要依据",
+    ...points.map((point, index) => `V-${String(index + 1).padStart(3, "0")}｜${point.locator}｜${point.riskLabel}｜${point.title}｜${point.references}`),
+  ].join("\n");
+  const reviewChecklist = [
+    "是否已完成全部关键验证点的采纳意见或拒绝意见确认？",
+    `是否需要对 ${match.clause.id} 的标准依据、适用范围和执行口径再做人工复核？`,
+    "高风险项是否已形成明确修订文本、责任主体和处置时限？",
+    "报告中的证据来源是否均可追溯到标准知识库、待验证文本或公开权威来源？",
+    "导出文档是否已随送审材料一并归档，便于后续版本比对？",
+  ]
+    .map((item, index) => `${index + 1}. ${item}`)
+    .join("\n");
+  const sources = [
+    `A01｜${match.clause.source}｜已构建标准知识库｜${match.clause.id} 条款比对、关键词命中和差异判断`,
+    `C01｜${draftFileName}｜待验证文本｜逐项关键验证点定位、专家确认和报告输出`,
+    "C02｜标准验证智能体规则库｜方法和样例｜报告章节、风险分级、置信度和专家复核清单",
+  ].join("\n");
 
-  return `格式化验证报告
+  return `标准验证意见报告
 
-文档名称：${draftFileName}
+《${draftFileName.replace(/\.[^.]+$/i, "")}》
+
+验证日期：${reportDate}
+验证对象：${draftFileName}
+验证定位：AI辅助“体检报告”，最终采纳和标准解释由主管部门及专家组确认
+证据范围：已构建标准知识库、待验证文本切片、关键验证点、专家确认意见和系统比对日志
 专家状态：${confirmed}
-匹配条款：${match.clause.id}
-综合置信度：${match.score} 分
-总体结论：${match.conclusion}
 
-一、逐项关键验证点
+一、验证结论摘要
+
+总体判断：本轮报告围绕 ${match.clause.source} / ${match.clause.id} 进行条款级比对，综合置信度 ${match.score} 分，结论为“${match.conclusion}”。当前报告已汇总专家逐项确认结果，可作为标准草案修订、复核和归档材料。
+问题数量：共${points.length}项，其中高风险${riskCounts["高风险"]}项、中风险${riskCounts["中风险"]}项、低风险${riskCounts["低风险"]}项。高风险项不等同于正式合法性结论，表示若不澄清可能导致执行冲突、依据不足、重复提交或数据合规争议。
+${riskSummaryRows}
+
+二、智能体定位、边界和证据等级
+
+定位：对待验证文本进行切片、知识库召回、标准条款比对、风险分级、建议文本生成和专家确认状态汇总。
+不越界事项：不替代合法性审查、备案审查、主管部门解释、专家表决和正式发布程序。
+A类证据：现行法律法规、有效政策文件、国家/行业/地方标准全文及权威目录清单。
+B类证据：标准知识库、公开网站元数据、历史验证报告、业务规则和权威政策解读。
+C类证据：待验证文本、用户上传材料、专家确认意见和系统执行日志，用于定位和佐证，不单独作强结论。
+
+三、重点修订方向
+
+${directions}
+
+四、逐条验证意见
+
 ${pointSections}
 
-二、报告结论
-本报告已记录每个关键验证点的采纳意见或拒绝意见，可作为标准草案修订和专家复核的结构化依据。`;
+五、问题索引表
+
+${indexRows}
+
+六、专家复核清单
+
+${reviewChecklist}
+
+七、主要依据与补充来源
+
+编号｜名称｜类型｜用途
+${sources}
+
+八、验证限制
+
+1. 本报告以当前可解析文本、已构建知识库和专家确认状态为基础，未替代正式法制审查、标准审定和业务会签。
+2. 风险等级用于提示发布和执行风险，不等同于认定违法或不合格。
+3. 若后续上传附件、表格、真实办件日志或公开来源证据发生变化，应重新生成报告并保留版本记录。
+4. 导出的 Word 文档应与原始待验证文本、证据链和专家确认记录一并归档。`;
 }
 
 export function isReadableDraftAttachment(fileName: string): boolean {

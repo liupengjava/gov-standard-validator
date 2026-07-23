@@ -28,6 +28,7 @@ import {
   isReadableDraftAttachment,
   isServerParsedDraftAttachment,
   isServerParsedKnowledgeAttachment,
+  mergePersistentSearchSites,
   normalizeParsedDraftText,
   normalizeDraftAttachmentText,
   normalizeBulkSignalText,
@@ -74,6 +75,9 @@ const DEFAULT_SEARCH_SITES: SearchSite[] = [
   { id: "zjzwfw", name: "浙江政务服务网", url: "https://www.zjzwfw.gov.cn/", category: "政务服务公开页" },
   { id: "hangzhou-gov", name: "杭州市人民政府", url: "https://www.hangzhou.gov.cn/", category: "地方政府公开页" },
 ];
+
+const SEARCH_SITES_STORAGE_KEY = "gov-validator.searchSites.v1";
+const ACTIVE_SEARCH_SITE_STORAGE_KEY = "gov-validator.activeSearchSiteId.v1";
 
 const INITIAL_KNOWLEDGE_FILE = buildKnowledgeFileAsset({
   name: "GB/T 32168-2015 政务服务中心网上服务规范.pdf",
@@ -154,6 +158,31 @@ function normalizeSearchSiteUrl(value: string): string {
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
+function readPersistedSearchSites(): SearchSite[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(SEARCH_SITES_STORAGE_KEY) || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (site): site is SearchSite =>
+        site &&
+        typeof site.id === "string" &&
+        typeof site.name === "string" &&
+        typeof site.url === "string" &&
+        typeof site.category === "string" &&
+        /^https?:\/\//i.test(site.url)
+    );
+  } catch {
+    return [];
+  }
+}
+
+function persistSearchSites(sites: SearchSite[], activeSiteId: string) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(SEARCH_SITES_STORAGE_KEY, JSON.stringify(sites));
+  window.localStorage.setItem(ACTIVE_SEARCH_SITE_STORAGE_KEY, activeSiteId);
+}
+
 export default function ValidatorConsole() {
   const { activeView, navigate } = useView();
 
@@ -206,8 +235,13 @@ export default function ValidatorConsole() {
   const [searchStatus, setSearchStatus] = useState("检索状态：待开始。");
   const [searchLog, setSearchLog] = useState<string[]>(["待获取：系统将展示检索词生成、来源 URL 请求、页面元数据解析、快照固化和证据链入库进度。"]);
   const [searching, setSearching] = useState(false);
-  const [searchSites, setSearchSites] = useState<SearchSite[]>(DEFAULT_SEARCH_SITES);
-  const [activeSearchSiteId, setActiveSearchSiteId] = useState(DEFAULT_SEARCH_SITES[0]?.id || "");
+  const [searchSites, setSearchSites] = useState<SearchSite[]>(() => mergePersistentSearchSites(DEFAULT_SEARCH_SITES, readPersistedSearchSites()));
+  const [activeSearchSiteId, setActiveSearchSiteId] = useState(() => {
+    if (typeof window === "undefined") return DEFAULT_SEARCH_SITES[0]?.id || "";
+    const sites = mergePersistentSearchSites(DEFAULT_SEARCH_SITES, readPersistedSearchSites());
+    const saved = window.localStorage.getItem(ACTIVE_SEARCH_SITE_STORAGE_KEY) || "";
+    return sites.some((site) => site.id === saved) ? saved : sites[0]?.id || "";
+  });
   const [newSearchSiteName, setNewSearchSiteName] = useState("");
   const [newSearchSiteUrl, setNewSearchSiteUrl] = useState("");
 
@@ -235,6 +269,11 @@ export default function ValidatorConsole() {
     agentLogEndRef.current?.scrollIntoView({ block: "end" });
     agentThinkingEndRef.current?.scrollIntoView({ block: "end" });
   }, [agentTrace, agentThinkingTrace]);
+
+  useEffect(() => {
+    if (!searchSites.length) return;
+    persistSearchSites(searchSites, activeSearchSiteId || searchSites[0]?.id || "");
+  }, [searchSites, activeSearchSiteId]);
 
   const playAgentLog = async (lines: AgentExecutionLogLine[], thinkingLines: AgentExecutionLogLine[] = []) => {
     const run = beginAgentExecutionRun(agentRunId.current);
@@ -916,7 +955,11 @@ ${effectiveMatch.issues.join("；")}
       url,
       category: searchScope,
     };
-    setSearchSites((prev) => prev.concat(site));
+    setSearchSites((prev) => {
+      const next = mergePersistentSearchSites(prev, [site]);
+      persistSearchSites(next, site.id);
+      return next;
+    });
     setActiveSearchSiteId(site.id);
     setNewSearchSiteName("");
     setNewSearchSiteUrl("");
@@ -925,8 +968,10 @@ ${effectiveMatch.issues.join("；")}
 
   const onRemoveSearchSite = (siteId: string) => {
     const next = searchSites.filter((site) => site.id !== siteId);
+    const nextActiveId = activeSearchSiteId === siteId ? next[0]?.id || "" : activeSearchSiteId;
     setSearchSites(next);
-    if (activeSearchSiteId === siteId) setActiveSearchSiteId(next[0]?.id || "");
+    persistSearchSites(next, nextActiveId);
+    if (activeSearchSiteId === siteId) setActiveSearchSiteId(nextActiveId);
     showToast("已移除检索网址");
   };
 
@@ -1032,21 +1077,37 @@ ${effectiveMatch.issues.join("；")}
     showToast("格式化验证报告已生成");
   };
 
-  const onDownloadFormattedReport = () => {
+  const onDownloadFormattedReport = async () => {
     if (!formattedReportText) {
       showToast("请先生成格式化报告");
       return;
     }
-    const blob = new Blob([buildReportDocumentHtml(formattedReportText)], { type: "application/msword;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `格式化验证报告-${effectiveMatch.clause.id}.doc`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-    showToast("报告文档已导出");
+    try {
+      const response = await fetch("/api/report/export-docx", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          reportText: formattedReportText,
+          title: `标准验证意见报告-${effectiveMatch.clause.id}`,
+        }),
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || "报告文档导出失败");
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `标准验证意见报告-${effectiveMatch.clause.id}.docx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      showToast("Word报告文档已导出");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "报告文档导出失败");
+    }
   };
 
   const displayedAgentTrace: AgentExecutionLogLine[] =

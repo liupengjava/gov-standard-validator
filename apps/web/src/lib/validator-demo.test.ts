@@ -15,6 +15,7 @@ import {
   buildKnowledgeFileAutoSlices,
   buildKnowledgeFileAsset,
   buildSignalImportCandidates,
+  mergePersistentSearchSites,
   filterVectorKnowledgeClauses,
   isReadableDraftAttachment,
   isServerParsedDraftAttachment,
@@ -36,6 +37,26 @@ test("resetSignalSamplesForRetest clears imported signal samples and selected in
   const reset = resetSignalSamplesForRetest(INITIAL_SIGNALS, 3);
 
   assert.deepEqual(reset, { signals: [], selectedSignalIndex: 0 });
+});
+
+test("mergePersistentSearchSites keeps maintained search sites across refresh without duplicates", () => {
+  const defaults = [
+    { id: "gov", name: "政府网站留言", url: "https://www.gov.cn/hudong/", category: "政府网站留言" },
+    { id: "zj", name: "浙江政务服务网", url: "https://www.zjzwfw.gov.cn/", category: "政务服务公开页" },
+  ];
+  const persisted = [
+    { id: "custom-1", name: "人民网留言板", url: "https://liuyan.people.com.cn/", category: "公开留言" },
+    { id: "duplicate", name: "浙江政务服务网", url: "https://www.zjzwfw.gov.cn/", category: "重复项" },
+  ];
+
+  const merged = mergePersistentSearchSites(defaults, persisted);
+
+  assert.deepEqual(merged.map((site) => site.url), [
+    "https://www.gov.cn/hudong/",
+    "https://www.zjzwfw.gov.cn/",
+    "https://liuyan.people.com.cn/",
+  ]);
+  assert.equal(merged[2].name, "人民网留言板");
 });
 
 test("buildSignalImportCandidates extracts comparable signal data with multi-part confidence", () => {
@@ -363,7 +384,17 @@ test("buildFormattedVerificationReport includes expert decisions for every verif
   }));
   const report = buildFormattedVerificationReport({ draftFileName: "draft.docx", match: result.match, points });
 
-  assert.ok(report.includes("格式化验证报告"));
+  assert.ok(report.includes("标准验证意见报告"));
+  assert.ok(report.includes("一、验证结论摘要"));
+  assert.ok(report.includes("二、智能体定位、边界和证据等级"));
+  assert.ok(report.includes("三、重点修订方向"));
+  assert.ok(report.includes("四、逐条验证意见"));
+  assert.ok(report.includes("五、问题索引表"));
+  assert.ok(report.includes("六、专家复核清单"));
+  assert.ok(report.includes("七、主要依据与补充来源"));
+  assert.ok(report.includes("八、验证限制"));
+  assert.ok(report.includes("等级｜数量｜主要领域｜处置建议"));
+  assert.ok(report.includes("编号｜条款｜风险｜问题标签｜主要依据"));
   assert.ok(report.includes("采纳意见"));
   assert.ok(report.includes("拒绝意见"));
   assert.ok(report.includes("专家确认完成"));
