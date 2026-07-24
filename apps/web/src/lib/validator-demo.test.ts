@@ -6,17 +6,27 @@ import {
   INITIAL_SIGNALS,
   beginAgentExecutionRun,
   buildAgentExecutionLog,
+  buildAgentExecutionStepCards,
   buildAgentExecutionTrace,
   buildAgentThinkingExecutionLog,
   buildDraftValidationStatus,
   buildFormattedVerificationReport,
   buildKeyVerificationPoints,
+  buildPublicSentimentSupport,
   buildKnowledgeCatalogSearchTasks,
+  buildFuzzyKnowledgeSearchTasks,
   buildKnowledgeFileAutoSlices,
+  buildKnowledgeParseProgressMessage,
   buildKnowledgeFileAsset,
+  buildRetrievedKnowledgeDocumentPreviewUrl,
+  decodeRetrievedKnowledgeDocumentPreviewUrl,
+  isRetrievedKnowledgeDocumentPreviewUrl,
+  buildKnowledgeSliceProgressMessage,
   buildSignalImportCandidates,
   mergePersistentSearchSites,
   filterVectorKnowledgeClauses,
+  paginatePublicSentimentVectorSamples,
+  paginateVectorKnowledgeClauses,
   isReadableDraftAttachment,
   isServerParsedDraftAttachment,
   isServerParsedKnowledgeAttachment,
@@ -25,10 +35,12 @@ import {
   normalizeParsedDraftText,
   nextKnowledgeVectorBuildStep,
   recordKnowledgeFileUsage,
+  removeDraftTextSlice,
   resetSignalSamplesForRetest,
   runDocumentValidation,
   sliceDraftTextForReview,
   sliceKnowledgeText,
+  updateDraftTextSlice,
   updateKnowledgeVectorBuild,
   verificationPointsAllConfirmed,
 } from "./validator-demo.ts";
@@ -57,6 +69,22 @@ test("mergePersistentSearchSites keeps maintained search sites across refresh wi
     "https://liuyan.people.com.cn/",
   ]);
   assert.equal(merged[2].name, "人民网留言板");
+});
+
+test("buildKnowledgeSliceProgressMessage reports upload slicing stages", () => {
+  assert.equal(buildKnowledgeSliceProgressMessage(0), "等待自动切分");
+  assert.equal(buildKnowledgeSliceProgressMessage(20), "正在准备待切分文本");
+  assert.equal(buildKnowledgeSliceProgressMessage(55), "正在识别条款编号和层级结构");
+  assert.equal(buildKnowledgeSliceProgressMessage(82), "正在生成条款级知识切片");
+  assert.equal(buildKnowledgeSliceProgressMessage(100, 18), "切分完成，已生成 18 个条款切片");
+});
+
+test("buildKnowledgeParseProgressMessage reports knowledge file parsing stages", () => {
+  assert.equal(buildKnowledgeParseProgressMessage(0), "等待解析文件");
+  assert.equal(buildKnowledgeParseProgressMessage(12), "正在准备解析任务");
+  assert.equal(buildKnowledgeParseProgressMessage(45), "正在抽取文档正文");
+  assert.equal(buildKnowledgeParseProgressMessage(78), "正在清洗正文结构");
+  assert.equal(buildKnowledgeParseProgressMessage(100), "解析完成，可自动切分");
 });
 
 test("buildSignalImportCandidates extracts comparable signal data with multi-part confidence", () => {
@@ -159,6 +187,73 @@ test("buildKnowledgeCatalogSearchTasks creates web search tasks from file-name c
   assert.equal(tasks[1].addedAt, "2026-07-21 10:30");
 });
 
+test("buildFuzzyKnowledgeSearchTasks creates multiple candidates for missing knowledge search", () => {
+  const tasks = buildFuzzyKnowledgeSearchTasks("地铁 政务服务 数据互通", "杭州市", "2026-07-23 16:20");
+
+  assert.equal(tasks.length >= 4, true);
+  assert.equal(tasks[0].status, "待检索");
+  assert.equal(tasks[0].sourceSite, "缺失知识模糊检索");
+  assert.ok(tasks[0].fileName.includes("地铁 政务服务 数据互通"));
+  assert.ok(tasks.every((task) => task.searchUrl.includes(encodeURIComponent("地铁 政务服务 数据互通"))));
+  assert.equal(new Set(tasks.map((task) => task.fileName)).size, tasks.length);
+  assert.ok(tasks.some((task) => task.message.includes("国家标准")));
+  assert.ok(tasks.some((task) => task.message.includes("办事指南")));
+});
+
+test("retrieved knowledge documents keep preview separate from search results", () => {
+  const task = buildKnowledgeCatalogSearchTasks("GBZ 24294.3-2017", "2026-07-24 09:20")[0];
+  const previewUrl = buildRetrievedKnowledgeDocumentPreviewUrl(task, "GBZ 24294.3-2017.pdf", "2026-07-24 09:22");
+  const asset = buildKnowledgeFileAsset({
+    name: "GBZ 24294.3-2017.pdf",
+    sourceType: "web",
+    sourceLabel: task.sourceSite,
+    addedAt: "2026-07-24 09:23",
+    sliceCount: 0,
+    vectorProgress: 0,
+    sourceUrl: previewUrl,
+    searchUrl: task.searchUrl,
+  });
+
+  assert.ok(previewUrl.startsWith("data:text/html;charset=utf-8,"));
+  assert.ok(decodeURIComponent(previewUrl).includes("已获取文档预览"));
+  assert.equal(isRetrievedKnowledgeDocumentPreviewUrl(previewUrl), true);
+  assert.ok(decodeRetrievedKnowledgeDocumentPreviewUrl(previewUrl).includes("GBZ 24294.3-2017.pdf"));
+  assert.notEqual(asset.sourceUrl, task.searchUrl);
+  assert.equal(asset.searchUrl, task.searchUrl);
+});
+
+test("retrieved knowledge documents show search result to official download chain", () => {
+  const task = buildKnowledgeCatalogSearchTasks("GB/T 39554.1-2020", "2026-07-24 09:20")[0];
+  const previewUrl = buildRetrievedKnowledgeDocumentPreviewUrl(task, "GB/T 39554.1-2020.pdf", "2026-07-24 09:22");
+  const html = decodeRetrievedKnowledgeDocumentPreviewUrl(previewUrl);
+
+  assert.ok(task.searchUrl.includes(encodeURIComponent("GB/T 39554.1-2020 PDF 标准")));
+  assert.equal(
+    task.searchResultUrl,
+    "https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=C72648A217E6E5E8E4EB074CB6EE0E9B"
+  );
+  assert.equal(task.downloadActionLabel, "下载标准");
+  assert.ok(html.includes("打开百度搜索结果"));
+  assert.ok(html.includes("进入国家标准全文公开系统详情页"));
+  assert.ok(html.includes("点击“下载标准”获取原文"));
+  assert.ok(html.includes(task.searchResultUrl || ""));
+});
+
+test("knowledge catalog uses the real official result link instead of a synthesized stdNo url", () => {
+  const task = buildKnowledgeCatalogSearchTasks("GB/Z 24294.3-2017", "2026-07-24 11:12")[0];
+  const previewUrl = buildRetrievedKnowledgeDocumentPreviewUrl(task, "GBZ 24294.3-2017.pdf", "2026-07-24 11:12");
+  const html = decodeRetrievedKnowledgeDocumentPreviewUrl(previewUrl);
+
+  assert.equal(
+    task.searchResultUrl,
+    "https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=58C700CFB8D4F0A5E0CC681D9D7453BD"
+  );
+  assert.equal(task.detailPageUrl, task.searchResultUrl);
+  assert.equal(task.searchResultUrl.includes("stdNo="), false);
+  assert.ok(html.includes("hcno=58C700CFB8D4F0A5E0CC681D9D7453BD"));
+  assert.equal(html.includes("stdNo=GBZ"), false);
+});
+
 test("knowledge file assets track vector progress, logs, access count, and call count", () => {
   const asset = buildKnowledgeFileAsset({
     name: "GBZ 24294.3-2017.pdf",
@@ -167,9 +262,11 @@ test("knowledge file assets track vector progress, logs, access count, and call 
     addedAt: "2026-07-21 10:40",
     sliceCount: 28,
     vectorProgress: 65,
+    sourceUrl: "blob:http://127.0.0.1/source-pdf",
   });
 
   assert.equal(asset.vectorLogs.some((line) => line.includes("65%")), true);
+  assert.equal(asset.sourceUrl, "blob:http://127.0.0.1/source-pdf");
   assert.equal(asset.accessCount, 0);
   assert.equal(asset.callCount, 0);
 
@@ -182,6 +279,7 @@ test("knowledge file assets track vector progress, logs, access count, and call 
   assert.equal(used.accessCount, 1);
   assert.equal(used.callCount, 1);
   assert.equal(used.lastCalledAt, "2026-07-21 10:50");
+  assert.equal(used.sourceUrl, "blob:http://127.0.0.1/source-pdf");
 });
 
 test("nextKnowledgeVectorBuildStep advances in-progress knowledge files and records logs", () => {
@@ -261,6 +359,30 @@ test("filterVectorKnowledgeClauses only shows completed vector clauses and suppo
   assert.equal(unfinishedHits.length, 0);
 });
 
+test("paginateVectorKnowledgeClauses returns fixed twenty-item pages and clamps page numbers", () => {
+  const items = Array.from({ length: 57 }, (_, index) => ({ id: `C-${index + 1}` }));
+
+  const firstPage = paginateVectorKnowledgeClauses(items, 1);
+  assert.equal(firstPage.pageSize, 20);
+  assert.equal(firstPage.pageCount, 3);
+  assert.equal(firstPage.items.length, 20);
+  assert.equal(firstPage.items[0].id, "C-1");
+  assert.equal(firstPage.start, 1);
+  assert.equal(firstPage.end, 20);
+
+  const lastPage = paginateVectorKnowledgeClauses(items, 9);
+  assert.equal(lastPage.page, 3);
+  assert.equal(lastPage.items.length, 17);
+  assert.equal(lastPage.items[0].id, "C-41");
+  assert.equal(lastPage.end, 57);
+
+  const emptyPage = paginateVectorKnowledgeClauses([], 1);
+  assert.equal(emptyPage.page, 1);
+  assert.equal(emptyPage.pageCount, 1);
+  assert.equal(emptyPage.start, 0);
+  assert.equal(emptyPage.end, 0);
+});
+
 test("buildKnowledgeFileAutoSlices creates clause slices for web-acquired knowledge files", () => {
   const asset = buildKnowledgeFileAsset({
     name: "GBT+25056-2018.pdf",
@@ -330,6 +452,57 @@ test("sliceDraftTextForReview groups extracted table rows by concrete clause ins
   assert.equal(slices.some((slice) => slice.text === "1" || slice.text === "2" || slice.text === "|"), false);
 });
 
+test("sliceDraftTextForReview ignores table-of-contents heading rows before real clauses", () => {
+  const slices = sliceDraftTextForReview(
+    `8 事项办理流程和要求 4
+9 安全管理 5
+10 评价与改进 5
+8.1 事项办理流程应包括申请、受理、审查、决定和送达等环节，并明确每个环节的责任主体。
+8.2 申请材料不齐全或者不符合法定形式的，应一次性告知申请人需要补正的全部内容。
+9.1 系统应记录事项办理过程，并对涉及个人信息的数据采取访问控制和脱敏措施。`,
+    "一窗通办工作规范.docx"
+  );
+
+  assert.equal(slices.some((slice) => slice.text === "8 事项办理流程和要求 4"), false);
+  assert.equal(slices.some((slice) => slice.text === "9 安全管理 5"), false);
+  assert.ok(slices.some((slice) => slice.text.includes("申请、受理、审查、决定和送达")));
+  assert.ok(slices.some((slice) => slice.text.includes("访问控制和脱敏措施")));
+});
+
+test("updateDraftTextSlice edits a slice and clears its confirmation status", () => {
+  const slices = sliceDraftTextForReview(
+    `1 范围
+政务服务事项应明确适用范围。
+2 材料补正
+窗口应一次性告知补正材料。`,
+    "draft.pdf"
+  );
+  const result = updateDraftTextSlice(slices, { "DV-002": "confirmed" }, "DV-002", {
+    title: "2 材料一次性补正",
+    text: "窗口应一次性告知申请人需要补正的全部材料。",
+  });
+
+  assert.equal(result.slices[1].title, "2 材料一次性补正");
+  assert.equal(result.slices[1].text, "窗口应一次性告知申请人需要补正的全部材料。");
+  assert.equal(result.slices[1].charCount, "窗口应一次性告知申请人需要补正的全部材料。".length);
+  assert.equal(result.slices[1].status, "pending");
+  assert.deepEqual(result.statuses, {});
+});
+
+test("removeDraftTextSlice deletes a slice and removes its confirmation status", () => {
+  const slices = sliceDraftTextForReview(
+    `1 范围
+政务服务事项应明确适用范围。
+2 材料补正
+窗口应一次性告知补正材料。`,
+    "draft.pdf"
+  );
+  const result = removeDraftTextSlice(slices, { "DV-001": "confirmed", "DV-002": "confirmed" }, "DV-001");
+
+  assert.deepEqual(result.slices.map((slice) => slice.id), ["DV-002"]);
+  assert.deepEqual(result.statuses, { "DV-002": "confirmed" });
+});
+
 test("normalizeDraftAttachmentText extracts useful text from json rows", () => {
   const raw = JSON.stringify([{ title: "事项说明", content: "材料不齐的，应一次性告知申请人补正内容。" }]);
   assert.equal(normalizeDraftAttachmentText(raw, "draft.json"), "材料不齐的，应一次性告知申请人补正内容。");
@@ -382,22 +555,47 @@ test("buildFormattedVerificationReport includes expert decisions for every verif
     ...point,
     status: index % 2 === 0 ? ("accepted" as const) : ("rejected" as const),
   }));
-  const report = buildFormattedVerificationReport({ draftFileName: "draft.docx", match: result.match, points });
+  const report = buildFormattedVerificationReport({ draftFileName: "draft.docx", match: result.match, points, signals: INITIAL_SIGNALS });
 
   assert.ok(report.includes("标准验证意见报告"));
   assert.ok(report.includes("一、验证结论摘要"));
   assert.ok(report.includes("二、智能体定位、边界和证据等级"));
-  assert.ok(report.includes("三、重点修订方向"));
-  assert.ok(report.includes("四、逐条验证意见"));
-  assert.ok(report.includes("五、问题索引表"));
-  assert.ok(report.includes("六、专家复核清单"));
-  assert.ok(report.includes("七、主要依据与补充来源"));
-  assert.ok(report.includes("八、验证限制"));
+  assert.ok(report.includes("三、标准知识库比对主结论"));
+  assert.ok(report.includes("四、群众感知佐证（辅助依据）"));
+  assert.ok(report.includes("五、重点修订方向"));
+  assert.ok(report.includes("六、逐条验证意见"));
+  assert.ok(report.includes("七、问题索引表"));
+  assert.ok(report.includes("八、专家复核清单"));
+  assert.ok(report.includes("九、主要依据与补充来源"));
+  assert.ok(report.includes("十、验证限制"));
+  assert.ok(report.indexOf("三、标准知识库比对主结论") < report.indexOf("四、群众感知佐证（辅助依据）"));
+  assert.ok(report.includes("不替代标准知识库比对结论"));
   assert.ok(report.includes("等级｜数量｜主要领域｜处置建议"));
   assert.ok(report.includes("编号｜条款｜风险｜问题标签｜主要依据"));
   assert.ok(report.includes("采纳意见"));
   assert.ok(report.includes("拒绝意见"));
   assert.ok(report.includes("专家确认完成"));
+});
+
+test("buildPublicSentimentSupport summarizes samples as auxiliary evidence", () => {
+  const result = runDocumentValidation("线上预审通过后，窗口仍要求群众重复提交纸质材料。", INITIAL_CLAUSES);
+  const support = buildPublicSentimentSupport({ match: result.match, signals: INITIAL_SIGNALS });
+
+  assert.equal(support.sampleCount > 0, true);
+  assert.equal(support.evidenceLevel, "辅助依据");
+  assert.ok(support.relatedSources.length > 0);
+  assert.ok(support.issueTags.length > 0);
+  assert.ok(support.boundaryNote.includes("不替代标准知识库比对结论"));
+});
+
+test("paginatePublicSentimentVectorSamples returns twenty samples per page", () => {
+  const samples = Array.from({ length: 41 }, (_, index) => ({ ...INITIAL_SIGNALS[index % INITIAL_SIGNALS.length], id: `s-${index}` }));
+  const page = paginatePublicSentimentVectorSamples(samples, 3, 20);
+
+  assert.equal(page.totalPages, 3);
+  assert.equal(page.items.length, 1);
+  assert.equal(page.startIndex, 40);
+  assert.equal(page.endIndex, 40);
 });
 
 test("buildAgentExecutionTrace summarizes the validation agent process", () => {
@@ -408,16 +606,18 @@ test("buildAgentExecutionTrace summarizes the validation agent process", () => {
     fileName: "草案.txt",
     issues: result.issues,
     match: result.match,
+    signals: INITIAL_SIGNALS,
   });
 
   assert.deepEqual(
     trace.map((step) => step.phase),
-    ["读取输入", "结构抽取", "规则校验", "知识库比对", "结论生成"]
+    ["读取输入", "结构抽取", "规则校验", "知识库比对", "舆情感知比对", "结论生成"]
   );
   assert.ok(trace.every((step) => step.status === "done"));
   assert.ok(trace[0].action.includes("草案.txt"));
   assert.ok(trace[2].thought.includes("材料补正表述不完整"));
   assert.ok(trace[3].evidence.includes("YC-8.3"));
+  assert.ok(trace[4].thought.includes("辅助依据"));
 });
 
 test("buildAgentExecutionLog expands trace into a scrollable audit log", () => {
@@ -428,13 +628,47 @@ test("buildAgentExecutionLog expands trace into a scrollable audit log", () => {
     fileName: "草案.docx",
     issues: result.issues,
     match: result.match,
+    signals: INITIAL_SIGNALS,
   });
 
-  assert.ok(log.length >= 16);
+  assert.ok(log.length >= 20);
   assert.deepEqual([...new Set(log.map((line) => line.kind))], ["system", "action", "reasoning", "evidence", "result"]);
   assert.ok(log.some((line) => line.message.includes("材料补正表述不完整")));
   assert.ok(log.some((line) => line.message.includes("YC-8.3")));
+  assert.ok(log.some((line) => line.phase === "舆情感知比对"));
   assert.ok(log.every((line) => /^\d{2}:\d{2}:\d{2}$/.test(line.time)));
+});
+
+test("buildAgentExecutionStepCards maps audit logs into validation step cards", () => {
+  const log = [
+    { time: "00:00:00", kind: "system" as const, phase: "Init", message: "Task created" },
+    { time: "00:00:02", kind: "action" as const, phase: "Read", message: "Read input" },
+    { time: "00:00:04", kind: "result" as const, phase: "Read", message: "Read complete" },
+    { time: "00:00:06", kind: "action" as const, phase: "Check", message: "Checking rules" },
+  ];
+
+  const pendingSteps = buildAgentExecutionStepCards(log, {
+    started: false,
+    running: false,
+    expectedPhases: ["Read", "Check", "Report"],
+  });
+  assert.deepEqual(pendingSteps.map((step) => step.status), ["pending", "pending", "pending"]);
+  assert.equal(pendingSteps[0].subActions.length, 2);
+
+  const runningSteps = buildAgentExecutionStepCards(log, {
+    started: true,
+    running: true,
+    expectedPhases: ["Read", "Check", "Report"],
+  });
+  assert.deepEqual(runningSteps.map((step) => step.status), ["done", "running", "pending"]);
+  assert.equal(runningSteps[1].summary, "Checking rules");
+
+  const completedSteps = buildAgentExecutionStepCards(log, {
+    started: true,
+    running: false,
+    expectedPhases: ["Read", "Check", "Report"],
+  });
+  assert.deepEqual(completedSteps.map((step) => step.status), ["done", "done", "pending"]);
 });
 
 test("buildAgentThinkingExecutionLog exposes agent-like command execution steps", () => {
@@ -445,6 +679,7 @@ test("buildAgentThinkingExecutionLog exposes agent-like command execution steps"
     fileName: "draft.docx",
     issues: result.issues,
     match: result.match,
+    signals: INITIAL_SIGNALS,
   });
 
   assert.ok(log.length >= 8);
@@ -454,6 +689,7 @@ test("buildAgentThinkingExecutionLog exposes agent-like command execution steps"
   );
   assert.ok(log.some((line) => line.message.includes("用户命令")));
   assert.ok(log.some((line) => line.message.includes("模拟工具调用")));
+  assert.ok(log.some((line) => line.message.includes("舆情感知")));
   assert.ok(log.some((line) => line.message.includes("逐项确认")));
   assert.equal(log.some((line) => line.message.includes("隐藏思维链")), false);
 });

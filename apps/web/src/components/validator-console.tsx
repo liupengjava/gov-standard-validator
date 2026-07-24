@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, CheckCircle2, Copy, Download, ExternalLink, Eye, FileSearch, FileText, Loader2, PlayCircle, RefreshCw, Search, Trash2, UploadCloud, XCircle } from "lucide-react";
+import { Activity, CheckCircle2, ChevronLeft, ChevronRight, Copy, Download, ExternalLink, Eye, FileSearch, FileText, Loader2, Pencil, PlayCircle, RefreshCw, Save, Search, Trash2, UploadCloud, XCircle } from "lucide-react";
 import { type AppView, useView } from "@/components/view-context";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,14 +15,22 @@ import {
   INITIAL_CLAUSES,
   INTERFACE_SAMPLES,
   buildFormattedVerificationReport,
+  buildFuzzyKnowledgeSearchTasks,
   buildKnowledgeCatalogSearchTasks,
   buildKnowledgeFileAutoSlices,
   buildKnowledgeFileAsset,
+  buildKnowledgeParseProgressMessage,
+  buildRetrievedKnowledgeDocumentPreviewUrl,
+  decodeRetrievedKnowledgeDocumentPreviewUrl,
+  isRetrievedKnowledgeDocumentPreviewUrl,
+  buildKnowledgeSliceProgressMessage,
   buildKeyVerificationPoints,
+  buildPublicSentimentSupport,
   buildSignalImportCandidates,
   compareStandardText,
   beginAgentExecutionRun,
   buildAgentExecutionLog,
+  buildAgentExecutionStepCards,
   buildAgentThinkingExecutionLog,
   buildDraftValidationStatus,
   isReadableDraftAttachment,
@@ -33,13 +41,17 @@ import {
   normalizeDraftAttachmentText,
   normalizeBulkSignalText,
   filterVectorKnowledgeClauses,
+  paginatePublicSentimentVectorSamples,
+  paginateVectorKnowledgeClauses,
   knowledgeClauseKey,
   nextKnowledgeVectorBuildStep,
   recordKnowledgeFileUsage,
+  removeDraftTextSlice,
   resetSignalSamplesForRetest,
   runDocumentValidation,
   sliceDraftTextForReview,
   sliceKnowledgeText,
+  updateDraftTextSlice,
   updateKnowledgeVectorBuild,
   verificationPointsAllConfirmed,
   type AgentExecutionLogLine,
@@ -190,14 +202,26 @@ export default function ValidatorConsole() {
   const [signals, setSignals] = useState<SignalSample[]>([]);
   const [pendingSlices, setPendingSlices] = useState<Clause[]>([]);
   const [selectedSignalIndex, setSelectedSignalIndex] = useState(0);
+  const [signalVectorPage, setSignalVectorPage] = useState(1);
 
   const [clauseSearch, setClauseSearch] = useState("");
   const [clauseFilter, setClauseFilter] = useState("全部");
+  const [knowledgeVectorPage, setKnowledgeVectorPage] = useState(1);
   const [kbRawText, setKbRawText] = useState("");
   const [kbFileName, setKbFileName] = useState("");
+  const [kbFileSourceUrl, setKbFileSourceUrl] = useState("");
   const [kbSourceType, setKbSourceType] = useState("公安政务服务标准");
   const [kbUploadStatus, setKbUploadStatus] = useState("维护状态：待上传或粘贴标准文本。");
+  const [kbParsing, setKbParsing] = useState(false);
+  const [kbParseProgress, setKbParseProgress] = useState(0);
+  const [kbParseStatus, setKbParseStatus] = useState(buildKnowledgeParseProgressMessage(0));
+  const [kbSlicing, setKbSlicing] = useState(false);
+  const [kbSliceProgress, setKbSliceProgress] = useState(0);
+  const [kbSliceStatus, setKbSliceStatus] = useState(buildKnowledgeSliceProgressMessage(0));
+  const [knowledgeSearchMode, setKnowledgeSearchMode] = useState<"catalog" | "fuzzy">("catalog");
   const [catalogInput, setCatalogInput] = useState("GBZ 24294.3-2017\nGB/T 39554.1-2020");
+  const [fuzzyKnowledgeQuery, setFuzzyKnowledgeQuery] = useState("地铁 政务服务 数据互通");
+  const [fuzzyKnowledgeRegion, setFuzzyKnowledgeRegion] = useState("杭州市");
   const [catalogTasks, setCatalogTasks] = useState<KnowledgeCatalogSearchTask[]>([]);
   const [knowledgeFiles, setKnowledgeFiles] = useState<KnowledgeFileAsset[]>(() => [INITIAL_KNOWLEDGE_FILE]);
   const [clauseAssetIds, setClauseAssetIds] = useState<Record<string, string>>(() =>
@@ -212,6 +236,9 @@ export default function ValidatorConsole() {
   const [draftFileName, setDraftFileName] = useState("样例标准草案.txt");
   const [draftSlices, setDraftSlices] = useState<DraftTextSlice[]>(() => sliceDraftTextForReview(DRAFT_SAMPLE, "样例标准草案.txt"));
   const [draftSliceStatuses, setDraftSliceStatuses] = useState<Record<string, DraftTextSliceStatus>>({});
+  const [editingDraftSliceId, setEditingDraftSliceId] = useState("");
+  const [editingDraftSliceTitle, setEditingDraftSliceTitle] = useState("");
+  const [editingDraftSliceText, setEditingDraftSliceText] = useState("");
   const [draftFileInputKey, setDraftFileInputKey] = useState(0);
   const [draftFileStatus, setDraftFileStatus] = useState(buildDraftValidationStatus("样例标准草案.txt", validateDraft(DRAFT_SAMPLE).length));
   const [agentTrace, setAgentTrace] = useState<AgentExecutionLogLine[]>([]);
@@ -271,6 +298,10 @@ export default function ValidatorConsole() {
   }, [agentTrace, agentThinkingTrace]);
 
   useEffect(() => {
+    setSignalVectorPage(1);
+  }, [signals.length]);
+
+  useEffect(() => {
     if (!searchSites.length) return;
     persistSearchSites(searchSites, activeSearchSiteId || searchSites[0]?.id || "");
   }, [searchSites, activeSearchSiteId]);
@@ -317,6 +348,10 @@ export default function ValidatorConsole() {
       }).length,
     [clauses, knowledgeFiles, clauseAssetIds]
   );
+  const pagedVectorClauses = useMemo(
+    () => paginateVectorKnowledgeClauses(filteredClauses, knowledgeVectorPage, 20),
+    [filteredClauses, knowledgeVectorPage]
+  );
 
   const issueCount = draftIssues.length;
   const dimensionStats = useMemo(() => countBy(clauses, (item) => item.dimension), [clauses]);
@@ -324,6 +359,14 @@ export default function ValidatorConsole() {
   const signalStats = useMemo(() => countBy(signals, (item) => item.source), [signals]);
 
   const effectiveMatch = currentMatch || compareStandardText(draftText || CLAUSE_SAMPLE, clauses);
+  const publicSentimentSupport = useMemo(
+    () => buildPublicSentimentSupport({ match: effectiveMatch, signals }),
+    [effectiveMatch, signals]
+  );
+  const pagedSignalVectors = useMemo(
+    () => paginatePublicSentimentVectorSamples(signals, signalVectorPage, 20),
+    [signals, signalVectorPage]
+  );
   const verificationPoints: KeyVerificationPoint[] = useMemo(
     () =>
       buildKeyVerificationPoints({ issues: draftIssues, match: effectiveMatch }).map((point) => {
@@ -362,6 +405,11 @@ ${effectiveMatch.clause.source} / ${effectiveMatch.clause.id}：${effectiveMatch
 差异风险：
 ${effectiveMatch.issues.join("；")}
 
+群众感知佐证（辅助依据）：
+关联样本 ${publicSentimentSupport.sampleCount} 条；问题标签：${publicSentimentSupport.issueTags.join("、") || "暂无明确标签"}。
+${publicSentimentSupport.summaries[0] || "暂无可用辅助样本。"}
+${publicSentimentSupport.boundaryNote}
+
 复核状态：
 待专家确认。报告结论仅作为条款修订和标准复核参考，不直接替代人工论证。`;
   const activeKnowledgeLog = knowledgeFiles.find((file) => file.id === activeKnowledgeLogId) || null;
@@ -380,6 +428,8 @@ ${effectiveMatch.issues.join("；")}
               lastAccessedAt: item.lastAccessedAt,
               lastCalledAt: item.lastCalledAt,
               vectorLogs: [...item.vectorLogs, ...asset.vectorLogs.slice(1)],
+              sourceUrl: asset.sourceUrl || item.sourceUrl,
+              searchUrl: asset.searchUrl || item.searchUrl,
             }
           : item
       );
@@ -407,19 +457,26 @@ ${effectiveMatch.issues.join("；")}
   };
 
   const onBuildCatalogSearchTasks = () => {
-    const tasks = buildKnowledgeCatalogSearchTasks(catalogInput, currentKnowledgeTime()).map((task) => ({
+    const tasks = (
+      knowledgeSearchMode === "catalog"
+        ? buildKnowledgeCatalogSearchTasks(catalogInput, currentKnowledgeTime())
+        : buildFuzzyKnowledgeSearchTasks(fuzzyKnowledgeQuery, fuzzyKnowledgeRegion, currentKnowledgeTime())
+    ).map((task) => ({
       ...task,
-      message: "待启动检索。系统将自动检索公开来源，获取文件成功后可加入知识库。",
+      message:
+        task.searchMode === "fuzzy"
+          ? task.message
+          : "待启动检索。系统将自动检索公开来源，获取文件成功后可加入知识库。",
     }));
     setCatalogTasks(tasks);
-    showToast(tasks.length ? `已生成 ${tasks.length} 个联网检索任务` : "请先输入文件名称目录清单");
+    showToast(tasks.length ? `已生成 ${tasks.length} 个联网检索任务` : knowledgeSearchMode === "catalog" ? "请先输入文件名称目录清单" : "请先输入模糊或缺失知识条件");
   };
 
   const onStartCatalogSearch = async (task: KnowledgeCatalogSearchTask) => {
     setCatalogTasks((prev) =>
       prev.map((item) =>
         item.id === task.id
-          ? { ...item, status: "检索中", message: `检索中：正在访问公开检索源，匹配 ${item.fileName} 的可获取文件。` }
+          ? { ...item, status: "检索中", message: `检索中：正在打开百度搜索结果，点击命中的公开来源链接，进入详情页后查找“${item.downloadActionLabel || "下载原文"}”。` }
           : item
       )
     );
@@ -431,7 +488,7 @@ ${effectiveMatch.issues.join("；")}
               ...item,
               status: "已获取",
               matchedTitle: knowledgeFileNameForCatalog(item.fileName),
-              message: `获取文件成功：已命中 ${knowledgeFileNameForCatalog(item.fileName)}，请点击“加入知识库”。`,
+              message: `获取原文成功：已从搜索结果进入${item.detailPageUrl ? "标准详情页" : "公开详情页"}，点击“${item.downloadActionLabel || "下载原文"}”并形成 ${knowledgeFileNameForCatalog(item.fileName)} 的固化文档，请点击“加入知识库”。`,
             }
           : item
       )
@@ -445,13 +502,17 @@ ${effectiveMatch.issues.join("；")}
       return;
     }
     const addedAt = currentKnowledgeTime();
+    const documentName = knowledgeFileNameForCatalog(task.fileName);
+    const documentPreviewUrl = buildRetrievedKnowledgeDocumentPreviewUrl(task, documentName, addedAt);
     const asset = buildKnowledgeFileAsset({
-      name: knowledgeFileNameForCatalog(task.fileName),
+      name: documentName,
       sourceType: "web",
       sourceLabel: task.sourceSite,
       addedAt,
       sliceCount: 0,
       vectorProgress: 0,
+      sourceUrl: documentPreviewUrl,
+      searchUrl: task.searchUrl,
     });
     upsertKnowledgeFile(asset);
     setCatalogTasks((prev) =>
@@ -469,6 +530,27 @@ ${effectiveMatch.issues.join("；")}
     const at = currentKnowledgeTime();
     setKnowledgeFiles((prev) => prev.map((item) => (item.id === id ? recordKnowledgeFileUsage(item, "access", at) : item)));
     setActiveKnowledgeLogId(id);
+  };
+
+  const onOpenKnowledgeFileSource = (file: KnowledgeFileAsset) => {
+    const at = currentKnowledgeTime();
+    setKnowledgeFiles((prev) => prev.map((item) => (item.id === file.id ? recordKnowledgeFileUsage(item, "access", at) : item)));
+    if (!file.sourceUrl) {
+      showToast("该知识文件暂无可查看的已获取文档，请先完成检索或上传文件");
+      return;
+    }
+    if (isRetrievedKnowledgeDocumentPreviewUrl(file.sourceUrl)) {
+      const html = decodeRetrievedKnowledgeDocumentPreviewUrl(file.sourceUrl);
+      if (!html) {
+        showToast("文档预览解析失败，请重新检索获取文件");
+        return;
+      }
+      const previewUrl = URL.createObjectURL(new Blob([html], { type: "text/html;charset=utf-8" }));
+      window.open(previewUrl, "_blank", "noopener,noreferrer");
+      window.setTimeout(() => URL.revokeObjectURL(previewUrl), 60_000);
+      return;
+    }
+    window.open(file.sourceUrl, "_blank", "noopener,noreferrer");
   };
 
   const onAutoSliceKnowledgeFile = (id: string) => {
@@ -525,6 +607,9 @@ ${effectiveMatch.issues.join("；")}
     const slices = sliceDraftTextForReview(text, fileName || "待验证文本");
     setDraftSlices(slices);
     setDraftSliceStatuses({});
+    setEditingDraftSliceId("");
+    setEditingDraftSliceTitle("");
+    setEditingDraftSliceText("");
     return slices;
   };
 
@@ -540,16 +625,70 @@ ${effectiveMatch.issues.join("；")}
     showToast("已确认全部待验证文本切片");
   };
 
-  const onAutoSliceKb = () => {
+  const onEditDraftSlice = (slice: DraftTextSlice) => {
+    setEditingDraftSliceId(slice.id);
+    setEditingDraftSliceTitle(slice.title);
+    setEditingDraftSliceText(slice.text);
+  };
+
+  const onCancelEditDraftSlice = () => {
+    setEditingDraftSliceId("");
+    setEditingDraftSliceTitle("");
+    setEditingDraftSliceText("");
+  };
+
+  const onSaveDraftSliceEdit = (sliceId: string) => {
+    const result = updateDraftTextSlice(draftSlices, draftSliceStatuses, sliceId, {
+      title: editingDraftSliceTitle,
+      text: editingDraftSliceText,
+    });
+    setDraftSlices(result.slices);
+    setDraftSliceStatuses(result.statuses);
+    setDraftText(result.slices.map((slice) => slice.text).join("\n"));
+    setFormattedReportText("");
+    onCancelEditDraftSlice();
+    showToast("已保存切片校正，请重新确认");
+  };
+
+  const onRemoveDraftSlice = (sliceId: string) => {
+    const result = removeDraftTextSlice(draftSlices, draftSliceStatuses, sliceId);
+    setDraftSlices(result.slices);
+    setDraftSliceStatuses(result.statuses);
+    setDraftText(result.slices.map((slice) => slice.text).join("\n"));
+    if (editingDraftSliceId === sliceId) onCancelEditDraftSlice();
+    setFormattedReportText("");
+    showToast("已删除该切片");
+  };
+
+  const onAutoSliceKb = async () => {
     const qualityError = getKnowledgeSliceTextError(kbRawText, kbFileName);
     if (qualityError) {
       setPendingSlices([]);
+      setKbSlicing(false);
+      setKbSliceProgress(0);
+      setKbSliceStatus(buildKnowledgeSliceProgressMessage(0));
       setKbUploadStatus(`维护状态：${qualityError}`);
       showToast("PDF 文本疑似乱码");
       return;
     }
+    setKbSlicing(true);
+    setKbSliceProgress(20);
+    setKbSliceStatus(buildKnowledgeSliceProgressMessage(20));
+    setKbUploadStatus("维护状态：正在准备待切分文本。");
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    setKbSliceProgress(55);
+    setKbSliceStatus(buildKnowledgeSliceProgressMessage(55));
+    setKbUploadStatus("维护状态：正在识别条款编号和层级结构。");
+    await new Promise((resolve) => setTimeout(resolve, 220));
     const slices = sliceKnowledgeText(kbRawText, kbSourceType, clauses.length);
+    setKbSliceProgress(82);
+    setKbSliceStatus(buildKnowledgeSliceProgressMessage(82));
+    setKbUploadStatus("维护状态：正在生成条款级知识切片。");
+    await new Promise((resolve) => setTimeout(resolve, 180));
     setPendingSlices(slices);
+    setKbSliceProgress(100);
+    setKbSliceStatus(buildKnowledgeSliceProgressMessage(100, slices.length));
+    setKbSlicing(false);
     setKbUploadStatus(`维护状态：已生成 ${slices.length} 个条款切片，待确认入库。`);
     showToast(`已自动切分 ${slices.length} 条`);
   };
@@ -567,6 +706,7 @@ ${effectiveMatch.issues.join("；")}
       addedAt: currentKnowledgeTime(),
       sliceCount: pendingSlices.length,
       vectorProgress: 55,
+      sourceUrl: kbFileSourceUrl,
     });
     upsertKnowledgeFile(asset);
     startKnowledgeVectorBuild(asset.id, asset.vectorProgress);
@@ -577,7 +717,14 @@ ${effectiveMatch.issues.join("；")}
     }));
     setKbRawText("");
     setKbFileName("");
+    setKbFileSourceUrl("");
     setPendingSlices([]);
+    setKbParsing(false);
+    setKbParseProgress(0);
+    setKbParseStatus(buildKnowledgeParseProgressMessage(0));
+    setKbSlicing(false);
+    setKbSliceProgress(0);
+    setKbSliceStatus(buildKnowledgeSliceProgressMessage(0));
     setKbUploadStatus(`维护状态：已入库 ${pendingSlices.length} 个切片，并刷新知识库索引。`);
     showToast(`已入库 ${pendingSlices.length} 个切片`);
   };
@@ -585,19 +732,38 @@ ${effectiveMatch.issues.join("；")}
   const onKnowledgeFileChange = async (file: File | undefined) => {
     if (!file) return;
     setPendingSlices([]);
+    setKbParsing(false);
+    setKbParseProgress(0);
+    setKbParseStatus(buildKnowledgeParseProgressMessage(0));
+    setKbSlicing(false);
+    setKbSliceProgress(0);
+    setKbSliceStatus(buildKnowledgeSliceProgressMessage(0));
     setKbFileName(file.name);
+    const sourceUrl = URL.createObjectURL(file);
+    setKbFileSourceUrl(sourceUrl);
     if (isServerParsedKnowledgeAttachment(file.name)) {
+      setKbParsing(true);
+      setKbParseProgress(16);
+      setKbParseStatus(buildKnowledgeParseProgressMessage(16));
       setKbUploadStatus(`维护状态：正在解析 ${file.name}，请稍候。`);
       try {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        setKbParseProgress(42);
+        setKbParseStatus(buildKnowledgeParseProgressMessage(42));
         const form = new FormData();
         form.append("file", file);
         const response = await fetch("/api/text/extract", { method: "POST", body: form });
+        setKbParseProgress(76);
+        setKbParseStatus(buildKnowledgeParseProgressMessage(76));
         const data = await response.json();
         if (!response.ok || !data.ok) throw new Error(data.error || "文档正文解析失败");
         const text = normalizeParsedDraftText(String(data.text || ""));
         if (!text) throw new Error("未提取到可切分的正文");
         const qualityError = getPdfUploadTextError(text, file.name);
         if (qualityError) throw new Error(qualityError);
+        setKbParseProgress(100);
+        setKbParseStatus(buildKnowledgeParseProgressMessage(100));
+        setKbParsing(false);
         setKbRawText(text);
         upsertKnowledgeFile(
           buildKnowledgeFileAsset({
@@ -607,11 +773,15 @@ ${effectiveMatch.issues.join("；")}
             addedAt: currentKnowledgeTime(),
             sliceCount: 0,
             vectorProgress: 15,
+            sourceUrl,
           })
         );
         setKbUploadStatus(`维护状态：已解析 ${file.name} 正文，可执行自动切分。`);
         showToast(`已解析 ${file.name}`);
       } catch (error) {
+        setKbParsing(false);
+        setKbParseProgress(0);
+        setKbParseStatus(buildKnowledgeParseProgressMessage(0));
         setKbRawText("");
         setKbUploadStatus(`维护状态：${file.name} 解析失败。${String(error).replace(/^Error:\s*/, "")}`);
         showToast("知识库文档解析失败");
@@ -625,6 +795,8 @@ ${effectiveMatch.issues.join("；")}
       return;
     }
     const text = normalizeDraftAttachmentText(await file.text(), file.name);
+    setKbParseProgress(100);
+    setKbParseStatus(buildKnowledgeParseProgressMessage(100));
     setKbRawText(text);
     upsertKnowledgeFile(
       buildKnowledgeFileAsset({
@@ -634,12 +806,17 @@ ${effectiveMatch.issues.join("；")}
         addedAt: currentKnowledgeTime(),
         sliceCount: 0,
         vectorProgress: 15,
+        sourceUrl,
       })
     );
     setKbUploadStatus(`维护状态：已读取 ${file.name}，可执行自动切分。`);
   };
 
   const onValidateDraft = () => {
+    if (editingDraftSliceId) {
+      showToast("请先保存或取消当前切片校正");
+      return;
+    }
     if (!reviewedDraftSlices.length) {
       const slices = buildDraftSlicesForReview(draftText, draftFileName || "待验证文本");
       setDraftFileStatus(`文档状态：已生成 ${slices.length} 个待验证文本切片，请先复核确认。`);
@@ -666,6 +843,7 @@ ${effectiveMatch.issues.join("；")}
       fileName: draftFileName || "粘贴文本",
       issues: result.issues,
       match: result.match,
+      signals,
     };
     void playAgentLog(
       buildAgentExecutionLog(agentInput),
@@ -1001,6 +1179,7 @@ ${effectiveMatch.issues.join("；")}
       fileName: draftFileName || "样例标准草案.txt",
       issues: result.issues,
       match: result.match,
+      signals,
     };
     void playAgentLog(
       buildAgentExecutionLog(agentInput),
@@ -1022,6 +1201,7 @@ ${effectiveMatch.issues.join("；")}
     setPendingSlices([]);
     setKbRawText("");
     setKbFileName("");
+    setKbFileSourceUrl("");
     setDraftText(DRAFT_SAMPLE);
     setDraftSlices(sliceDraftTextForReview(DRAFT_SAMPLE, "样例标准草案.txt"));
     setDraftSliceStatuses({});
@@ -1071,6 +1251,7 @@ ${effectiveMatch.issues.join("；")}
         draftFileName: draftFileName || "粘贴文本",
         match: effectiveMatch,
         points: verificationPoints,
+        signals,
       })
     );
     setReportCount((v) => v + 1);
@@ -1133,6 +1314,21 @@ ${effectiveMatch.issues.join("；")}
           { time: "00:12", kind: "action", phase: "执行落地", message: "执行落地：生成关键验证点，等待专家逐项采纳意见或拒绝意见。" },
           { time: "00:14", kind: "result", phase: "结果输出", message: "结果输出：全部确认后生成格式化验证报告，并支持下载导出。" },
         ];
+  const agentExecutionStarted = agentRunning || agentTrace.length > 0;
+  const executionStepCards = buildAgentExecutionStepCards(displayedAgentTrace, {
+    started: agentExecutionStarted,
+    running: agentRunning,
+  });
+  const activeExecutionStep =
+    executionStepCards.find((step) => step.status === "running") ||
+    [...executionStepCards].reverse().find((step) => step.status === "done") ||
+    executionStepCards[0];
+  const completedExecutionStepCount = executionStepCards.filter((step) => step.status === "done").length;
+  const executionProgress = Math.round(
+    ((completedExecutionStepCount + (executionStepCards.some((step) => step.status === "running") ? 0.5 : 0)) /
+      Math.max(1, executionStepCards.length)) *
+      100
+  );
 
   const dashboardWorkflowStats: Array<[string, string, string, string, AppView]> = [
     ["01 知识构建", `${clauses.length * 61 + 1} 条`, "PDF / Word 自动解析，按章节、条款、指标生成标准切片。", "from-white to-[#f2faff]", "knowledge"],
@@ -1191,7 +1387,7 @@ ${effectiveMatch.issues.join("；")}
               <Button variant="outline" onClick={() => buildDraftSlicesForReview(draftText, draftFileName || "待验证文本")}>
                 重新切片
               </Button>
-              <Button variant="primary" onClick={onConfirmAllDraftSlices} disabled={!reviewedDraftSlices.length || allDraftSlicesConfirmed}>
+              <Button variant="primary" onClick={onConfirmAllDraftSlices} disabled={!reviewedDraftSlices.length || allDraftSlicesConfirmed || !!editingDraftSliceId}>
                 <CheckCircle2 className="h-4 w-4" />
                 全部确认
               </Button>
@@ -1203,20 +1399,55 @@ ${effectiveMatch.issues.join("；")}
               {reviewedDraftSlices.map((slice) => (
                 <div key={slice.id} className="rounded-lg border border-[#d8e9f7] bg-white/82 p-4 shadow-sm">
                   <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <div className="text-sm font-semibold text-[#075ec9]">{slice.id} · {slice.title}</div>
+                    <div className="min-w-0 flex-1">
+                      {editingDraftSliceId === slice.id ? (
+                        <Input value={editingDraftSliceTitle} onChange={(e) => setEditingDraftSliceTitle(e.target.value)} />
+                      ) : (
+                        <div className="text-sm font-semibold text-[#075ec9]">{slice.id} · {slice.title}</div>
+                      )}
                       <div className="mt-1 text-xs text-muted-foreground">{slice.charCount} 字 · {slice.sourceName}</div>
                     </div>
                     <Badge variant={slice.status === "confirmed" ? "success" : "warning"}>
                       {slice.status === "confirmed" ? "已确认" : "待确认"}
                     </Badge>
                   </div>
-                  <p className="mt-3 line-clamp-4 text-sm leading-7 text-[#14304f]">{slice.text}</p>
-                  <div className="mt-4 flex justify-end">
-                    <Button variant={slice.status === "confirmed" ? "ghost" : "outline"} onClick={() => onConfirmDraftSlice(slice.id)}>
-                      <CheckCircle2 className="h-4 w-4" />
-                      确认切片无误
-                    </Button>
+                  {editingDraftSliceId === slice.id ? (
+                    <textarea
+                      className="gov-input mt-3 min-h-32 w-full rounded-lg p-3 text-sm leading-7 outline-none"
+                      value={editingDraftSliceText}
+                      onChange={(e) => setEditingDraftSliceText(e.target.value)}
+                    />
+                  ) : (
+                    <p className="mt-3 line-clamp-4 text-sm leading-7 text-[#14304f]">{slice.text}</p>
+                  )}
+                  <div className="mt-4 flex flex-wrap justify-end gap-2">
+                    {editingDraftSliceId === slice.id ? (
+                      <>
+                        <Button variant="primary" onClick={() => onSaveDraftSliceEdit(slice.id)} disabled={!editingDraftSliceText.trim()}>
+                          <Save className="h-4 w-4" />
+                          保存校正
+                        </Button>
+                        <Button variant="ghost" onClick={onCancelEditDraftSlice}>
+                          <XCircle className="h-4 w-4" />
+                          取消
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <Button variant="outline" onClick={() => onEditDraftSlice(slice)}>
+                          <Pencil className="h-4 w-4" />
+                          校正
+                        </Button>
+                        <Button variant="ghost" onClick={() => onRemoveDraftSlice(slice.id)}>
+                          <Trash2 className="h-4 w-4" />
+                          删除
+                        </Button>
+                        <Button variant={slice.status === "confirmed" ? "ghost" : "outline"} onClick={() => onConfirmDraftSlice(slice.id)}>
+                          <CheckCircle2 className="h-4 w-4" />
+                          确认切片无误
+                        </Button>
+                      </>
+                    )}
                   </div>
                 </div>
               ))}
@@ -1228,67 +1459,174 @@ ${effectiveMatch.issues.join("；")}
           )}
         </Card>
 
-        <div className="grid gap-4 xl:grid-cols-2">
-          <div className="gov-agent-window rounded-lg p-6 text-slate-100">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="space-y-3">
-                <Button variant="primary" onClick={onValidateDraft} disabled={agentRunning || !allDraftSlicesConfirmed}>
-                  <PlayCircle className="h-4 w-4" />
-                  开始文本验证
-                </Button>
-                <div>
-                  <h2 className="text-xl font-semibold">过程审计窗口</h2>
-                  <p className="mt-2 text-xs text-slate-300">保留规划、工具调用、推理摘要和证据命中。</p>
-                </div>
+        <section className="rounded-[14px] border border-[#d8e9f7] bg-white/94 p-5 shadow-[0_16px_40px_rgba(23,90,145,0.12)]">
+          <div className="grid gap-4 border-b border-[#d8e9f7] pb-5 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
+            <div>
+              <div className="flex flex-wrap items-center gap-3">
+                <span className={`h-2.5 w-2.5 rounded-full ${agentRunning ? "bg-[#168df3] shadow-[0_0_0_6px_rgba(22,141,243,0.12)]" : agentTrace.length ? "bg-[#13a875]" : "bg-[#8799aa]"}`} />
+                <h2 className="text-xl font-semibold text-[#12304f]">智能体执行过程</h2>
+                <Badge variant={agentRunning ? "warning" : agentTrace.length ? "success" : "warning"}>
+                  {agentRunning ? "执行中" : agentTrace.length ? "已完成" : "待执行"}
+                </Badge>
               </div>
-              <Badge variant={agentRunning ? "warning" : agentTrace.length ? "success" : "warning"}>
-                {agentRunning ? "执行中" : agentTrace.length ? "已完成" : "待执行"}
-              </Badge>
-            </div>
-            <div className="gov-scrollbar mt-5 max-h-[560px] overflow-y-auto pr-1 text-[12px] leading-6">
-              {displayedAgentTrace.map((line, index) => (
-                <div key={`${line.time}-${line.phase}-${index}`} className="grid gap-3 border-b border-white/8 py-4 last:border-b-0 md:grid-cols-[72px_72px_1fr]">
-                  <span className="font-mono text-slate-200">{line.time}</span>
-                  <span className="flex h-9 w-12 items-center justify-center rounded-full bg-[#0c4f91] text-[11px] text-[#bde6ff]">
-                    {({ system: "系统", action: "执行", reasoning: "推理", evidence: "检索", result: "结果" } as const)[line.kind]}
-                  </span>
-                  <span className="text-slate-200">
-                    <span className="mr-3 text-slate-400">[{line.phase}]</span>
-                    {line.message}
-                  </span>
+              <div className="mt-3 grid max-w-[620px] grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
+                <div className="h-2 overflow-hidden rounded-full bg-[#e8f3fb]">
+                  <div className="h-full rounded-full bg-linear-to-r from-[#168df3] to-[#16b89e] transition-all" style={{ width: `${executionProgress}%` }} />
                 </div>
-              ))}
-              <div ref={agentLogEndRef} />
+                <span className="text-xs font-semibold text-[#075ec9]">{completedExecutionStepCount} / {executionStepCards.length} 已完成 · {executionProgress}%</span>
+              </div>
             </div>
+            <Button variant="primary" onClick={onValidateDraft} disabled={agentRunning || !allDraftSlicesConfirmed || !!editingDraftSliceId}>
+              {agentRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlayCircle className="h-4 w-4" />}
+              开始文本验证
+            </Button>
           </div>
 
-          <div className="gov-agent-window rounded-lg p-6 text-slate-100">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <h2 className="text-xl font-semibold">思考与执行过程</h2>
-                <p className="mt-2 text-xs text-slate-300">展示命令接收、任务拆解、工具调用、证据读取和落地动作。</p>
-              </div>
-              <Badge variant={agentRunning ? "warning" : agentThinkingTrace.length ? "success" : "warning"}>
-                {agentRunning ? "同步生成" : agentThinkingTrace.length ? "已记录" : "待执行"}
-              </Badge>
-            </div>
-            <div className="gov-scrollbar mt-5 max-h-[560px] overflow-y-auto pr-1 text-[12px] leading-6">
-              {displayedAgentThinkingTrace.map((line, index) => (
-                <div key={`${line.time}-${line.phase}-${index}`} className="grid gap-3 border-b border-white/8 py-4 last:border-b-0 md:grid-cols-[72px_72px_1fr]">
-                  <span className="font-mono text-slate-200">{line.time}</span>
-                  <span className="flex h-9 w-12 items-center justify-center rounded-full bg-[#14472f] text-[11px] text-[#baf2d0]">
-                    {({ system: "接收", action: "执行", reasoning: "判断", evidence: "依据", result: "输出" } as const)[line.kind]}
-                  </span>
-                  <span className="text-slate-200">
-                    <span className="mr-3 text-slate-400">[{line.phase}]</span>
-                    {line.message}
-                  </span>
+          <div className="mt-5 grid gap-4 xl:grid-cols-[minmax(360px,0.92fr)_minmax(420px,1.08fr)]">
+            <div className="rounded-xl border border-[#d8e9f7] bg-[#f7fcff] p-4">
+              <div className="mb-4 flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <h3 className="font-semibold text-[#12304f]">执行步骤</h3>
+                  <p className="mt-1 text-xs leading-5 text-[#5f7891]">已完成阶段折叠展示，当前阶段自动展开保留审计明细。</p>
                 </div>
-              ))}
-              <div ref={agentThinkingEndRef} />
+                <Badge variant={agentRunning ? "warning" : agentTrace.length ? "success" : "info"}>{agentRunning ? "运行中" : agentTrace.length ? "已归档" : "等待确认"}</Badge>
+              </div>
+              <div className="space-y-2">
+                {executionStepCards.map((step, index) => (
+                  <details
+                    key={step.phase}
+                    open={step.status === "running"}
+                    className={`group rounded-lg border bg-white shadow-sm transition ${
+                      step.status === "running"
+                        ? "border-[#9ed0f5] shadow-[0_10px_22px_rgba(22,141,243,0.10)]"
+                        : step.status === "done"
+                          ? "border-[#ccecdf]"
+                          : "border-[#d8e9f7]"
+                    }`}
+                  >
+                    <summary className="grid cursor-pointer list-none grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-4 py-3 [&::-webkit-details-marker]:hidden">
+                      <span
+                        className={`grid h-7 w-7 place-items-center rounded-full border text-xs font-semibold ${
+                          step.status === "done"
+                            ? "border-[#bfe9d9] bg-[#eafaf5] text-[#13a875]"
+                            : step.status === "running"
+                              ? "border-[#b9def8] bg-[#edf8ff] text-[#168df3]"
+                              : "border-[#c8dcec] bg-white text-[#8799aa]"
+                        }`}
+                      >
+                        {step.status === "done" ? <CheckCircle2 className="h-4 w-4" /> : step.status === "running" ? <Loader2 className="h-4 w-4 animate-spin" /> : index + 1}
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-semibold text-[#12304f]">{index + 1}. {step.phase}</span>
+                        <span className="mt-1 block truncate text-xs leading-5 text-[#5f7891]">{step.summary}</span>
+                      </span>
+                      <span
+                        className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                          step.status === "done"
+                            ? "bg-[#eafaf5] text-[#13a875]"
+                            : step.status === "running"
+                              ? "bg-[#edf8ff] text-[#075ec9]"
+                              : "bg-[#eef3f7] text-[#62788e]"
+                        }`}
+                      >
+                        {step.status === "done" ? "已完成" : step.status === "running" ? "执行中" : "待执行"}
+                      </span>
+                    </summary>
+                    <div className="px-4 pb-4 pl-[58px]">
+                      <div className="space-y-2 border-l-2 border-[#e6eef6] pl-3">
+                        {step.subActions.length ? (
+                          step.subActions.map((line, lineIndex) => (
+                            <div key={`${step.phase}-${line.time}-${lineIndex}`} className="grid gap-2 text-xs leading-5 text-[#6f8295] md:grid-cols-[minmax(0,1fr)_auto]">
+                              <span>
+                                <b className="text-[#405a74]">{({ action: "执行", reasoning: "推理", evidence: "依据", result: "结果", system: "系统" } as const)[line.kind]}：</b>
+                                {line.message}
+                              </span>
+                              <span className="font-mono text-[#a0adba]">{line.time}</span>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="text-xs text-[#8799aa]">等待上一阶段完成后写入明细。</div>
+                        )}
+                      </div>
+                    </div>
+                  </details>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-[#d8e9f7] bg-[#f7fcff] p-4">
+              <div className="mb-4 flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <h3 className="font-semibold text-[#12304f]">当前步骤明细</h3>
+                  <p className="mt-1 text-xs leading-5 text-[#5f7891]">同步展示底层命令、任务拆解、工具调用和证据读取。</p>
+                </div>
+                <Badge variant={agentRunning ? "warning" : agentThinkingTrace.length ? "success" : "info"}>
+                  {agentRunning ? "同步生成" : agentThinkingTrace.length ? "已记录" : "待执行"}
+                </Badge>
+              </div>
+
+              <div className="rounded-lg border border-[#d8e9f7] bg-white p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h4 className="text-lg font-semibold text-[#12304f]">{activeExecutionStep ? activeExecutionStep.phase : "等待执行"}</h4>
+                  <Badge variant={activeExecutionStep?.status === "done" ? "success" : activeExecutionStep?.status === "running" ? "warning" : "info"}>
+                    {activeExecutionStep?.status === "done" ? "已完成" : activeExecutionStep?.status === "running" ? "执行中" : "待执行"}
+                  </Badge>
+                </div>
+                <p className="mt-2 text-sm leading-6 text-[#5f7891]">{activeExecutionStep?.summary || "请先确认切片后开始验证。"}</p>
+
+                <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                  <div className="rounded-lg border border-[#d8e9f7] bg-[#fafdff] p-3">
+                    <span className="block text-xs text-[#5f7891]">待验证切片</span>
+                    <b className="mt-1 block text-lg text-[#075ec9]">{reviewedDraftSlices.length}</b>
+                  </div>
+                  <div className="rounded-lg border border-[#d8e9f7] bg-[#fafdff] p-3">
+                    <span className="block text-xs text-[#5f7891]">已确认切片</span>
+                    <b className="mt-1 block text-lg text-[#075ec9]">{confirmedDraftSliceCount}</b>
+                  </div>
+                  <div className="rounded-lg border border-[#d8e9f7] bg-[#fafdff] p-3">
+                    <span className="block text-xs text-[#5f7891]">发现问题</span>
+                    <b className="mt-1 block text-lg text-[#075ec9]">{issueCount}</b>
+                  </div>
+                </div>
+
+                {activeExecutionStep?.phase === "舆情感知比对" && (
+                  <div className="mt-3 grid gap-3 rounded-lg border border-[#cfe4f5] bg-[#fafdff] p-3 sm:grid-cols-3">
+                    <div>
+                      <span className="block text-xs text-[#5f7891]">召回样本</span>
+                      <b className="mt-1 block text-lg text-[#0f9f8f]">{publicSentimentSupport.sampleCount}</b>
+                    </div>
+                    <div>
+                      <span className="block text-xs text-[#5f7891]">问题标签</span>
+                      <b className="mt-1 block text-sm text-[#14304f]">{publicSentimentSupport.issueTags.join("、") || "暂无标签"}</b>
+                    </div>
+                    <div>
+                      <span className="block text-xs text-[#5f7891]">证据级别</span>
+                      <b className="mt-1 block text-sm text-[#14304f]">{publicSentimentSupport.evidenceLevel}</b>
+                    </div>
+                    <p className="sm:col-span-3 text-xs leading-5 text-[#5f7891]">{publicSentimentSupport.boundaryNote}</p>
+                  </div>
+                )}
+
+                <div className="gov-scrollbar mt-4 max-h-[360px] overflow-y-auto rounded-lg border border-[#dbeaf7] bg-[#fbfdff] p-3 text-xs leading-6 text-[#65788b]">
+                  {displayedAgentThinkingTrace.map((line, index) => (
+                    <div key={`${line.time}-${line.phase}-${index}`} className="grid gap-2 border-b border-[#e6eef6] py-2 last:border-b-0 md:grid-cols-[72px_72px_1fr]">
+                      <span className="font-mono text-[#8799aa]">{line.time}</span>
+                      <span className="w-fit rounded-full bg-[#edf8ff] px-2 py-0.5 text-[11px] font-semibold text-[#075ec9]">
+                        {({ system: "接收", action: "执行", reasoning: "判断", evidence: "依据", result: "输出" } as const)[line.kind]}
+                      </span>
+                      <span className="text-[#49657e]">
+                        <span className="mr-2 text-[#8799aa]">[{line.phase}]</span>
+                        {line.message}
+                      </span>
+                    </div>
+                  ))}
+                  <div ref={agentThinkingEndRef} />
+                  <div ref={agentLogEndRef} />
+                </div>
+              </div>
             </div>
           </div>
-        </div>
+        </section>
 
         {!!toast && <div className="fixed bottom-5 right-5 rounded-lg bg-[#07315d] px-4 py-2 text-sm text-white shadow-[0_18px_36px_rgba(7,49,93,0.24)]">{toast}</div>}
       </div>
@@ -1406,20 +1744,44 @@ ${effectiveMatch.issues.join("；")}
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <h3 className="font-medium">目录清单联网获取</h3>
-                  <p className="mt-1 text-xs text-muted-foreground">按文件名或标准号逐行生成互联网检索任务，确认命中后加入知识库。</p>
+                  <p className="mt-1 text-xs text-muted-foreground">支持按文件名/标准号精确检索，也支持按模糊条件或缺失知识生成多个候选文件。</p>
                 </div>
                 <FileSearch className="h-5 w-5 text-[#168df3]" />
               </div>
-              <textarea
-                className="gov-input min-h-28 w-full rounded-lg p-3 text-sm outline-none"
-                value={catalogInput}
-                onChange={(e) => setCatalogInput(e.target.value)}
-                placeholder="每行一个文件名称或标准号，例如：GBZ 24294.3-2017"
-              />
+              <div className="grid grid-cols-2 gap-2 rounded-lg border border-[#d8e9f7] bg-white/70 p-1">
+                <button
+                  type="button"
+                  className={`rounded-md px-3 py-2 text-sm font-semibold ${knowledgeSearchMode === "catalog" ? "bg-[#168df3] text-white shadow-sm" : "text-[#49657e] hover:bg-[#edf8ff]"}`}
+                  onClick={() => setKnowledgeSearchMode("catalog")}
+                >
+                  标准号/标题检索
+                </button>
+                <button
+                  type="button"
+                  className={`rounded-md px-3 py-2 text-sm font-semibold ${knowledgeSearchMode === "fuzzy" ? "bg-[#168df3] text-white shadow-sm" : "text-[#49657e] hover:bg-[#edf8ff]"}`}
+                  onClick={() => setKnowledgeSearchMode("fuzzy")}
+                >
+                  模糊/缺失知识检索
+                </button>
+              </div>
+              {knowledgeSearchMode === "catalog" ? (
+                <textarea
+                  className="gov-input min-h-28 w-full rounded-lg p-3 text-sm outline-none"
+                  value={catalogInput}
+                  onChange={(e) => setCatalogInput(e.target.value)}
+                  placeholder="每行一个文件名称或标准号，例如：GBZ 24294.3-2017"
+                />
+              ) : (
+                <div className="grid gap-2">
+                  <Input value={fuzzyKnowledgeQuery} onChange={(e) => setFuzzyKnowledgeQuery(e.target.value)} placeholder="输入缺失知识或模糊条件，例如：地铁 政务服务 数据互通" />
+                  <Input value={fuzzyKnowledgeRegion} onChange={(e) => setFuzzyKnowledgeRegion(e.target.value)} placeholder="适用地区，例如：杭州市、浙江省、全国" />
+                  <p className="text-xs text-muted-foreground">将自动扩展为国家标准、行业标准、地方标准、政策文件、办事指南等多个候选文件。</p>
+                </div>
+              )}
               <div className="flex flex-wrap gap-2">
                 <Button variant="primary" onClick={onBuildCatalogSearchTasks}>
                   <Search className="h-4 w-4" />
-                  生成联网检索任务
+                  {knowledgeSearchMode === "catalog" ? "生成联网检索任务" : "生成候选检索结果"}
                 </Button>
               </div>
               {!!catalogTasks.length && (
@@ -1431,7 +1793,11 @@ ${effectiveMatch.issues.join("；")}
                     <div key={task.id} className="rounded-lg border border-[#d8e9f7] bg-white/78 p-3 text-sm">
                       <div className="flex flex-wrap items-start justify-between gap-2">
                         <div>
-                          <div className="font-semibold text-[#0b315e]">{task.fileName}</div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-semibold text-[#0b315e]">{task.fileName}</span>
+                            {task.candidateType ? <span className="rounded bg-[#e8f5ff] px-2 py-0.5 text-xs text-[#075ec9]">{task.candidateType}</span> : null}
+                            {task.searchMode === "fuzzy" ? <span className="rounded bg-[#eafaf5] px-2 py-0.5 text-xs text-[#0f8f78]">多候选</span> : null}
+                          </div>
                           <p className="mt-1 text-xs text-muted-foreground">{task.message}</p>
                         </div>
                         <Badge variant={task.status === "已获取" ? "success" : task.status === "检索中" ? "info" : "warning"}>{task.status}</Badge>
@@ -1507,9 +1873,9 @@ ${effectiveMatch.issues.join("；")}
                         <td className="px-3 py-2">{file.accessCount} / {file.callCount}</td>
                         <td className="px-3 py-2">
                           <div className="flex flex-wrap gap-1">
-                            <Button variant="ghost" onClick={() => onViewKnowledgeFile(file.id)}>
+                            <Button variant="ghost" onClick={() => onOpenKnowledgeFileSource(file)}>
                               <Eye className="h-4 w-4" />
-                              查看
+                              查看原文
                             </Button>
                             <Button variant="outline" onClick={() => onAutoSliceKnowledgeFile(file.id)} disabled={file.sliceCount > 0}>
                               <FileSearch className="h-4 w-4" />
@@ -1572,14 +1938,50 @@ ${effectiveMatch.issues.join("；")}
               onChange={(e) => {
                 setKbRawText(e.target.value);
                 setKbFileName("");
+                setKbFileSourceUrl("");
+                setPendingSlices([]);
+                setKbParsing(false);
+                setKbParseProgress(0);
+                setKbParseStatus(buildKnowledgeParseProgressMessage(0));
+                setKbSlicing(false);
+                setKbSliceProgress(0);
+                setKbSliceStatus(buildKnowledgeSliceProgressMessage(0));
               }}
             />
             <div className="flex flex-wrap gap-2">
-              <Button variant="outline" onClick={onAutoSliceKb}>自动切分</Button>
-              <Button variant="primary" onClick={onImportSlices}>确认入库</Button>
-              <Button variant="ghost" onClick={() => { setPendingSlices([]); setKbRawText(""); setKbFileName(""); setKbUploadStatus("维护状态：待上传或粘贴标准文本。"); }}>清空</Button>
+              <Button variant="outline" onClick={onAutoSliceKb} disabled={kbSlicing}>自动切分</Button>
+              <Button variant="primary" onClick={onImportSlices} disabled={kbSlicing}>确认入库</Button>
+              <Button variant="ghost" onClick={() => { setPendingSlices([]); setKbRawText(""); setKbFileName(""); setKbFileSourceUrl(""); setKbParsing(false); setKbParseProgress(0); setKbParseStatus(buildKnowledgeParseProgressMessage(0)); setKbSlicing(false); setKbSliceProgress(0); setKbSliceStatus(buildKnowledgeSliceProgressMessage(0)); setKbUploadStatus("维护状态：待上传或粘贴标准文本。"); }}>清空</Button>
             </div>
             <p className="text-xs text-muted-foreground">{kbUploadStatus}</p>
+            {(kbParsing || kbParseProgress > 0) && (
+              <div className="space-y-1.5 rounded-lg border border-[#d8e9f7] bg-white/72 px-3 py-2">
+                <div className="flex items-center justify-between gap-3 text-xs text-[#49657e]">
+                  <span>{kbParseStatus}</span>
+                  <span className="font-semibold text-[#075ec9]">{kbParseProgress}%</span>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-[#e8f3fb]">
+                  <div
+                    className="h-full rounded-full bg-linear-to-r from-[#168df3] to-[#8fc7ff] transition-all duration-300"
+                    style={{ width: `${kbParseProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+            {(kbSlicing || kbSliceProgress > 0) && (
+              <div className="space-y-1.5 rounded-lg border border-[#d8e9f7] bg-white/72 px-3 py-2">
+                <div className="flex items-center justify-between gap-3 text-xs text-[#49657e]">
+                  <span>{kbSliceStatus}</span>
+                  <span className="font-semibold text-[#075ec9]">{kbSliceProgress}%</span>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-[#e8f3fb]">
+                  <div
+                    className="h-full rounded-full bg-linear-to-r from-[#168df3] to-[#20c4a8] transition-all duration-300"
+                    style={{ width: `${kbSliceProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
             {!!pendingSlices.length && (
               <div className="space-y-2">
                 {pendingSlices.map((slice) => (
@@ -1592,51 +1994,120 @@ ${effectiveMatch.issues.join("；")}
             )}
           </div>
 
-          <div className="grid gap-2 lg:grid-cols-2">
-            <Input value={clauseSearch} onChange={(e) => setClauseSearch(e.target.value)} placeholder="语义检索已构建向量条款，例如：材料补正一次性告知要求" />
-            <select className="gov-input h-9 rounded-lg px-3 text-sm outline-none" value={clauseFilter} onChange={(e) => setClauseFilter(e.target.value)}>
+          <div className="rounded-lg border border-[#d8e9f7] bg-white/80 p-4 shadow-sm">
+            <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-semibold text-[#0b315e]">知识库向量区</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">所有“确认入库”的切片统一进入本区，完成向量构建后可检索、筛选、分页查看。</p>
+              </div>
+              <Badge variant="info">20 条 / 页</Badge>
+            </div>
+            <div className="grid gap-2 lg:grid-cols-2">
+              <Input
+                value={clauseSearch}
+                onChange={(e) => {
+                  setClauseSearch(e.target.value);
+                  setKnowledgeVectorPage(1);
+                }}
+                placeholder="语义检索已构建向量条款，例如：材料补正一次性告知要求"
+              />
+              <select
+                className="gov-input h-9 rounded-lg px-3 text-sm outline-none"
+                value={clauseFilter}
+                onChange={(e) => {
+                  setClauseFilter(e.target.value);
+                  setKnowledgeVectorPage(1);
+                }}
+              >
               {["全部", "流程", "材料", "资源", "安全", "评价"].map((item) => (
                 <option key={item} value={item}>
                   {item === "全部" ? "全部维度" : item}
                 </option>
               ))}
-            </select>
-          </div>
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#d8e9f7] bg-white/72 px-3 py-2 text-xs text-muted-foreground">
-            <span>已完成向量知识库：{completedVectorFileCount} 个文件，形成 {completedVectorClauseCount} 条条款切片。</span>
-            <span>当前筛选显示：{filteredClauses.length} 条</span>
-          </div>
-          <div className="gov-scrollbar overflow-auto rounded-lg border border-[#d8e9f7] bg-white/80">
-            <table className="w-full min-w-[860px] text-left text-sm">
-              <thead className="bg-[#edf8ff]">
-                <tr>
-                  <th className="px-3 py-2">条款 ID</th>
-                  <th className="px-3 py-2">来源标准</th>
-                  <th className="px-3 py-2">验证维度</th>
-                  <th className="px-3 py-2">条款摘要</th>
-                  <th className="px-3 py-2">约束</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredClauses.length ? (
-                  filteredClauses.map((clause) => (
-                    <tr key={clause.id} className="border-t border-[#e4f0f8] align-top hover:bg-[#f7fcff]">
-                      <td className="px-3 py-2 font-medium">{clause.id}</td>
-                      <td className="px-3 py-2">{clause.source}</td>
-                      <td className="px-3 py-2">{clause.dimension}</td>
-                      <td className="px-3 py-2 text-muted-foreground">{clause.text}</td>
-                      <td className="px-3 py-2">{clause.constraint}</td>
-                    </tr>
-                  ))
-                ) : (
-                  <tr className="border-t border-[#e4f0f8]">
-                    <td className="px-3 py-6 text-center text-sm text-muted-foreground" colSpan={5}>
-                      暂无符合条件的已构建向量条款。请确认知识文件向量进度已完成，或调整语义检索词和维度。
-                    </td>
+              </select>
+            </div>
+
+            <div className="mt-3 grid gap-2 md:grid-cols-4">
+              <div className="rounded-lg border border-[#d8e9f7] bg-[#fafdff] p-3">
+                <span className="block text-xs text-muted-foreground">已入库文件</span>
+                <b className="mt-1 block text-lg text-[#075ec9]">{completedVectorFileCount}</b>
+              </div>
+              <div className="rounded-lg border border-[#d8e9f7] bg-[#fafdff] p-3">
+                <span className="block text-xs text-muted-foreground">条款向量</span>
+                <b className="mt-1 block text-lg text-[#075ec9]">{completedVectorClauseCount}</b>
+              </div>
+              <div className="rounded-lg border border-[#d8e9f7] bg-[#fafdff] p-3">
+                <span className="block text-xs text-muted-foreground">当前筛选</span>
+                <b className="mt-1 block text-lg text-[#075ec9]">{filteredClauses.length}</b>
+              </div>
+              <div className="rounded-lg border border-[#d8e9f7] bg-[#fafdff] p-3">
+                <span className="block text-xs text-muted-foreground">当前页</span>
+                <b className="mt-1 block text-lg text-[#075ec9]">{pagedVectorClauses.page} / {pagedVectorClauses.pageCount}</b>
+              </div>
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#d8e9f7] bg-[#f7fcff] px-3 py-2 text-xs text-muted-foreground">
+              <span>当前筛选显示：{pagedVectorClauses.start}-{pagedVectorClauses.end} 条 / 共 {pagedVectorClauses.total} 条</span>
+              <span>所有切片入库后的知识库向量集中在此区域查看。</span>
+            </div>
+
+            <div className="gov-scrollbar mt-3 overflow-auto rounded-lg border border-[#d8e9f7] bg-white/80">
+              <table className="w-full min-w-[980px] text-left text-sm">
+                <thead className="bg-[#edf8ff]">
+                  <tr>
+                    <th className="px-3 py-2">条款 ID</th>
+                    <th className="px-3 py-2">来源文件</th>
+                    <th className="px-3 py-2">验证维度</th>
+                    <th className="px-3 py-2">条款摘要</th>
+                    <th className="px-3 py-2">约束</th>
+                    <th className="px-3 py-2">向量状态</th>
                   </tr>
-                )}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {pagedVectorClauses.items.length ? (
+                    pagedVectorClauses.items.map((clause) => (
+                      <tr key={`${clause.source}-${clause.id}`} className="border-t border-[#e4f0f8] align-top hover:bg-[#f7fcff]">
+                        <td className="px-3 py-2 font-medium text-[#0b315e]">{clause.id}</td>
+                        <td className="px-3 py-2">{clause.source}</td>
+                        <td className="px-3 py-2">{clause.dimension}</td>
+                        <td className="px-3 py-2 text-muted-foreground">{clause.text}</td>
+                        <td className="px-3 py-2">{clause.constraint}</td>
+                        <td className="px-3 py-2"><Badge variant="success">已完成</Badge></td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr className="border-t border-[#e4f0f8]">
+                      <td className="px-3 py-6 text-center text-sm text-muted-foreground" colSpan={6}>
+                        暂无符合条件的已构建向量条款。请确认知识文件向量进度已完成，或调整语义检索词和维度。
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+              <Button variant="outline" onClick={() => setKnowledgeVectorPage((page) => page - 1)} disabled={pagedVectorClauses.page <= 1}>
+                <ChevronLeft className="h-4 w-4" />
+                上一页
+              </Button>
+              <div className="flex flex-wrap gap-1">
+                {Array.from({ length: pagedVectorClauses.pageCount }, (_, index) => index + 1).map((page) => (
+                  <Button
+                    key={page}
+                    variant={page === pagedVectorClauses.page ? "primary" : "ghost"}
+                    size="sm"
+                    onClick={() => setKnowledgeVectorPage(page)}
+                  >
+                    {page}
+                  </Button>
+                ))}
+              </div>
+              <Button variant="outline" onClick={() => setKnowledgeVectorPage((page) => page + 1)} disabled={pagedVectorClauses.page >= pagedVectorClauses.pageCount}>
+                下一页
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </div>
           </div>
         </Card>
       )}
@@ -2128,6 +2599,58 @@ ${effectiveMatch.issues.join("；")}
                 </div>
               ))}
             </div>
+            <div className="rounded-lg border border-[#d8e9f7] bg-[#f7fcff] p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-sm font-semibold text-[#14304f]">舆情样本向量区</h3>
+                  <p className="mt-1 text-xs text-muted-foreground">按样本切片入库结果分页查看，每页 20 条，作为条款验证的辅助召回来源。</p>
+                </div>
+                <Badge variant="info">{pagedSignalVectors.total} 条</Badge>
+              </div>
+              {pagedSignalVectors.items.length ? (
+                <>
+                  <div className="mt-3 space-y-2">
+                    {pagedSignalVectors.items.map((signal, index) => (
+                      <div key={`signal-vector-${signal.id}`} className="rounded-md border border-[#d8e9f7] bg-white/78 p-2 text-xs leading-5 text-[#49657e]">
+                        <div className="flex flex-wrap items-center gap-2 font-semibold text-[#14304f]">
+                          <span>#{pagedSignalVectors.startIndex + index + 1}</span>
+                          <span>{signal.source}</span>
+                          <span className="text-[#9ab0c5]">|</span>
+                          <span>{signal.type}</span>
+                          {signal.matchedClauseId && <Badge variant="info">{signal.matchedClauseId}</Badge>}
+                          <Badge variant="warning">辅助向量</Badge>
+                        </div>
+                        <p className="mt-1 text-[#14304f]">{signal.text}</p>
+                        <div className="mt-1 flex flex-wrap gap-2 text-[#698198]">
+                          <span>地域：{signal.region}</span>
+                          {signal.confidence && <span>置信度：{signal.confidence} 分</span>}
+                          {signal.evidenceStatus && <span>来源状态：{signal.evidenceStatus === "real_collected" ? "真实采集" : signal.evidenceStatus === "imported" ? "解析导入" : "模拟样本"}</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs text-muted-foreground">
+                      第 {pagedSignalVectors.page} / {pagedSignalVectors.totalPages} 页 · 显示 {pagedSignalVectors.startIndex + 1}-{pagedSignalVectors.endIndex + 1}
+                    </span>
+                    <div className="flex gap-2">
+                      <Button type="button" variant="outline" size="sm" onClick={() => setSignalVectorPage((page) => Math.max(1, page - 1))} disabled={pagedSignalVectors.page <= 1}>
+                        <ChevronLeft className="h-3.5 w-3.5" />
+                        上一页
+                      </Button>
+                      <Button type="button" variant="outline" size="sm" onClick={() => setSignalVectorPage((page) => Math.min(pagedSignalVectors.totalPages, page + 1))} disabled={pagedSignalVectors.page >= pagedSignalVectors.totalPages}>
+                        下一页
+                        <ChevronRight className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="mt-3 rounded-lg border border-dashed border-[#cfe4f5] bg-white/70 p-3 text-xs text-muted-foreground">
+                  暂无舆情样本向量。可通过公开检索、批量导入或接口同步形成辅助样本。
+                </div>
+              )}
+            </div>
           </Card>
 
           <Card className="space-y-4">
@@ -2160,6 +2683,29 @@ ${effectiveMatch.issues.join("；")}
                 还有 {verificationPoints.length - confirmedVerificationCount} 个关键验证点未确认。全部选择“采纳意见”或“拒绝意见”后，系统会开放正式报告生成。
               </div>
             )}
+
+            <div className="rounded-lg border border-[#d8e9f7] bg-[#f7fcff] p-4 text-sm leading-6 text-[#14304f]">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="font-semibold">群众感知佐证（辅助依据）</h3>
+                <Badge variant="info">{publicSentimentSupport.sampleCount} 条样本</Badge>
+              </div>
+              <div className="mt-3 grid gap-2 sm:grid-cols-3">
+                <div className="rounded-md border border-[#d8e9f7] bg-white/72 p-2">
+                  <span className="block text-xs text-muted-foreground">来源</span>
+                  <b className="mt-1 block text-xs text-[#14304f]">{publicSentimentSupport.relatedSources.join("、") || "暂无来源"}</b>
+                </div>
+                <div className="rounded-md border border-[#d8e9f7] bg-white/72 p-2">
+                  <span className="block text-xs text-muted-foreground">问题标签</span>
+                  <b className="mt-1 block text-xs text-[#14304f]">{publicSentimentSupport.issueTags.join("、") || "暂无标签"}</b>
+                </div>
+                <div className="rounded-md border border-[#d8e9f7] bg-white/72 p-2">
+                  <span className="block text-xs text-muted-foreground">证据级别</span>
+                  <b className="mt-1 block text-xs text-[#14304f]">{publicSentimentSupport.evidenceLevel}</b>
+                </div>
+              </div>
+              <p className="mt-3 text-xs leading-5 text-muted-foreground">{publicSentimentSupport.summaries[0] || "暂无可用辅助样本。"}</p>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">{publicSentimentSupport.boundaryNote}</p>
+            </div>
 
             <pre className="gov-scrollbar max-h-[68vh] overflow-auto whitespace-pre-wrap rounded-lg border border-[#d8e9f7] bg-white/78 p-5 text-sm leading-7 text-[#14304f]">{formattedReportText || reportText}</pre>
           </Card>

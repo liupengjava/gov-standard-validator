@@ -76,6 +76,23 @@ test('chunkStandardDocument does not cap output at twelve chunks', () => {
   assert.equal(chunks.filter((chunk) => /^5\.\d+$/.test(chunk.clauseNo || '')).length, 16);
 });
 
+test('chunkStandardDocument splits OCR table rows that contain multiple inline clause numbers', () => {
+  const chunks = chunkStandardDocument({
+    text: `GB/T 32168-2015
+政务服务中心网上服务规范
+4 基本原则 4.1 公开性 应及时、准确公开相关信息。 4.2 安全性 应建立安全管理机制。4.3 易用性 应界面清晰。
+5 服务提供 5.1 总则 应提供服务向导。5.2 信息公开服务 5.2.1 基本信息公示 应及时更新。5.2.2 事项办理指南公示 应提供办理指南。`,
+    sourceMethod: 'ocr',
+  });
+
+  assert.deepEqual(
+    chunks.map((chunk) => chunk.clauseNo),
+    ['4', '4.1', '4.2', '4.3', '5', '5.1', '5.2.1', '5.2.2']
+  );
+  assert.equal(chunks.find((chunk) => chunk.clauseNo === '5')?.text.includes('5.2.2'), false);
+  assert.equal(chunks.some((chunk) => chunk.clauseNo === '5.2'), false);
+});
+
 test('chunkStandardDocument normalizes OCR spaces and marks OCR chunks', () => {
   const chunks = chunkStandardDocument({
     text: `G B / T 32168—2015\n政 务 服 务 中 心 网 上 服 务 规 范\n1 范 围\n本 标 准 规 定 了 网 上 服 务 要 求。`,

@@ -69,11 +69,24 @@ function isCatalogLine(line: string): boolean {
   return /^(?:前言|引言|附录|参考文献|\d+(?:\.\d+)*\s+|[A-Z]\.\d+)/.test(line);
 }
 
+function splitInlineClauseHeadings(line: string): string[] {
+  let working = line
+    .replace(/([。；;])(?=\d+\.\d+(?:\.\d+)*\s+[\u4e00-\u9fffA-Za-z])/g, '$1\n')
+    .replace(/\s+(?=\d+\.\d+(?:\.\d+)*\s+[\u4e00-\u9fffA-Za-z])/g, '\n')
+    .replace(/^(\d+)\s+(.+?)\s+(?=\d+\.\d+(?:\.\d+)*\s+[\u4e00-\u9fffA-Za-z])/, '$1 $2\n');
+  const parts = working
+    .split('\n')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return parts.length ? parts : [line];
+}
+
 function buildLines(rawText: string): string[] {
   const normalized = normalizeText(rawText);
   const rawLines = normalized
     .split('\n')
     .map((line) => line.replace(/\s+/g, ' ').trim())
+    .flatMap(splitInlineClauseHeadings)
     .filter(Boolean);
   const counts = new Map<string, number>();
   rawLines.forEach((line) => counts.set(line, (counts.get(line) || 0) + 1));
@@ -182,13 +195,13 @@ export function chunkStandardDocument(input: {
   const sourceMethod = input.sourceMethod || 'native';
   const chunks: StandardChunk[] = [];
   const stack: ParsedHeading[] = [];
-  let current: { heading: ParsedHeading; body: string[] } | undefined;
+  let current: { heading: ParsedHeading; body: string[]; hasChild: boolean } | undefined;
 
   const flush = () => {
     if (!current) return;
     const headingText = displayHeading(current.heading);
     const body = current.body.join('\n').trim();
-    if (!body && current.heading.level > 1) {
+    if (!body && current.hasChild && current.heading.level > 1) {
       current = undefined;
       return;
     }
@@ -221,10 +234,11 @@ export function chunkStandardDocument(input: {
   for (const line of lines) {
     const heading = parseHeading(line);
     if (heading) {
+      if (current && heading.level > current.heading.level) current.hasChild = true;
       flush();
       while (stack.length && stack[stack.length - 1].level >= heading.level) stack.pop();
       stack.push(heading);
-      current = { heading, body: [] };
+      current = { heading, body: [], hasChild: false };
       continue;
     }
     if (!current) continue;

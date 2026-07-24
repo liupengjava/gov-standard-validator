@@ -108,6 +108,22 @@ function keywordTokens(keyword: string): string[] {
     .filter((item) => item.length >= 2);
 }
 
+function htmlFragmentToText(html: string): string {
+  return decodeHtmlEntities(
+    html
+      .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scoreTextByKeyword(text: string, keyword: string): number {
+  const lower = text.toLowerCase();
+  return keywordTokens(keyword).reduce((sum, token) => sum + (lower.includes(token) ? 1 : 0), 0);
+}
+
 function selectEvidenceText(lines: string[], keyword: string): string {
   const tokens = keywordTokens(keyword);
   const scored = lines
@@ -121,9 +137,64 @@ function selectEvidenceText(lines: string[], keyword: string): string {
   return selected.join("\n").slice(0, 620);
 }
 
+function extractCandidateLinks(html: string, baseUrl: string, keyword: string): { url: string; label: string; score: number }[] {
+  const seen = new Set<string>();
+  const links: { url: string; label: string; score: number }[] = [];
+  for (const match of html.matchAll(/<a\b[^>]*>[\s\S]*?<\/a>/gi)) {
+    const attrs = parseTagAttrs(match[0]);
+    const href = attrs.href || "";
+    if (!href || /^(?:javascript|mailto|tel):/i.test(href)) continue;
+    const label = htmlFragmentToText(match[0]);
+    if (label.length < 4) continue;
+    let url = "";
+    try {
+      const parsed = new URL(href, baseUrl);
+      parsed.hash = "";
+      url = parsed.toString();
+    } catch {
+      continue;
+    }
+    if (url === baseUrl || seen.has(url)) continue;
+    const score = scoreTextByKeyword(`${label} ${url}`, keyword);
+    if (score <= 0) continue;
+    seen.add(url);
+    links.push({ url, label, score });
+  }
+  return links.sort((a, b) => b.score - a.score || b.label.length - a.label.length).slice(0, 3);
+}
+
 function buildSnapshotUrl(html: string, sourceUrl: string): string {
   const snapshot = `<!doctype html><html><head><meta charset="utf-8"><base href="${sourceUrl}"></head><body>${html}</body></html>`;
   return `data:text/html;charset=utf-8;base64,${Buffer.from(snapshot, "utf-8").toString("base64")}`;
+}
+
+function buildSample(input: PublicSignalCollectionInput, site: PublicSignalCollectionSite, args: {
+  html: string;
+  finalUrl: string;
+  pageTitle: string;
+  publishedAt: string;
+  capturedAt: string;
+  text: string;
+}): PublicSignalCollectedSample {
+  return {
+    source: site.name,
+    region: input.region,
+    type: `公开网络-${input.scope}`,
+    text: args.text,
+    status: "待复核",
+    sourceUrl: args.finalUrl,
+    pageTitle: args.pageTitle,
+    publishedAt: args.publishedAt,
+    capturedAt: args.capturedAt,
+    snapshotUrl: buildSnapshotUrl(args.html, args.finalUrl),
+    evidenceStatus: "real_collected",
+    evidenceChain: [
+      { stage: "fetch", label: "来源 URL 请求", detail: `${site.name} ${args.finalUrl}`, at: args.capturedAt },
+      { stage: "metadata", label: "页面元数据解析", detail: `${args.pageTitle}${args.publishedAt ? ` / ${args.publishedAt}` : ""}`, at: args.capturedAt },
+      { stage: "content", label: "正文证据抽取", detail: `按主题“${input.keyword}”抽取 ${args.text.length} 字`, at: args.capturedAt },
+      { stage: "snapshot", label: "页面快照固化", detail: "已生成 HTML 快照，可用于复核来源页面当时内容。", at: args.capturedAt },
+    ],
+  };
 }
 
 export async function collectPublicSignalSamples(
@@ -150,27 +221,53 @@ export async function collectPublicSignalSamples(
     const publishedAt = extractPublishedAt(html);
     const lines = htmlToLines(html);
     const text = selectEvidenceText(lines, input.keyword);
-    if (!text) continue;
+    const candidateLinks = extractCandidateLinks(html, finalUrl, input.keyword);
 
-    results.push({
-      source: site.name,
-      region: input.region,
-      type: `公开网络-${input.scope}`,
-      text,
-      status: "待复核",
-      sourceUrl: finalUrl,
-      pageTitle,
-      publishedAt,
-      capturedAt,
-      snapshotUrl: buildSnapshotUrl(html, finalUrl),
-      evidenceStatus: "real_collected",
-      evidenceChain: [
-        { stage: "fetch", label: "来源 URL 请求", detail: `${site.name} ${finalUrl}`, at: capturedAt },
-        { stage: "metadata", label: "页面元数据解析", detail: `${pageTitle}${publishedAt ? ` / ${publishedAt}` : ""}`, at: capturedAt },
-        { stage: "content", label: "正文证据抽取", detail: `按主题“${input.keyword}”抽取 ${text.length} 字`, at: capturedAt },
-        { stage: "snapshot", label: "页面快照固化", detail: "已生成 HTML 快照，可用于复核来源页面当时内容。", at: capturedAt },
-      ],
-    });
+    for (const link of candidateLinks) {
+      try {
+        const detailCapturedAt = nowText();
+        const detailResponse = await fetcher(link.url, {
+          headers: {
+            "user-agent": "GovStandardValidator/0.1 public-signal-collector",
+            accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+          },
+          signal: AbortSignal.timeout(12000),
+        });
+        if (!detailResponse.ok) throw new Error(`HTTP ${detailResponse.status}`);
+        const detailHtml = await detailResponse.text();
+        const detailUrl = detailResponse.headers.get("x-final-url") || detailResponse.url || link.url;
+        const detailTitle = extractPageTitle(detailHtml, link.label || pageTitle);
+        const detailPublishedAt = extractPublishedAt(detailHtml) || publishedAt;
+        const detailText = selectEvidenceText(htmlToLines(detailHtml), input.keyword) || link.label;
+        if (!detailText) continue;
+        results.push(
+          buildSample(input, site, {
+            html: detailHtml,
+            finalUrl: detailUrl,
+            pageTitle: detailTitle,
+            publishedAt: detailPublishedAt,
+            capturedAt: detailCapturedAt,
+            text: detailText,
+          })
+        );
+      } catch {
+        if (!link.label) continue;
+        results.push(
+          buildSample(input, site, {
+            html,
+            finalUrl,
+            pageTitle: link.label,
+            publishedAt,
+            capturedAt,
+            text: link.label,
+          })
+        );
+      }
+    }
+
+    if (!candidateLinks.length && text) {
+      results.push(buildSample(input, site, { html, finalUrl, pageTitle, publishedAt, capturedAt, text }));
+    }
   }
 
   return results;

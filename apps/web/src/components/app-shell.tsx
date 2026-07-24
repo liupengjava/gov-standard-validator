@@ -30,12 +30,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <div className="gov-app-bg flex h-screen gap-5 overflow-hidden">
         <Sidebar>
           <SidebarHeader>
-            <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-linear-to-br from-[#1ca7ff] to-[#075ec9] text-base font-bold text-white shadow-[0_14px_28px_rgba(22,141,243,0.3)]">
-              标
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-[15px] font-semibold leading-tight text-[#14304f]">标准验证智能体</div>
-              <div className="text-[11px] text-muted-foreground">Gov Standard Validator</div>
+            <div className="flex min-w-0 flex-1 flex-col gap-2">
+              <div className="truncate text-[13px] font-semibold leading-tight text-[#075ec9]">临平公安</div>
+              <div className="flex min-w-0 items-center gap-3">
+                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-linear-to-br from-[#1ca7ff] to-[#075ec9] text-base font-bold text-white shadow-[0_14px_28px_rgba(22,141,243,0.3)]">
+                  标
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[15px] font-semibold leading-tight text-[#14304f]">标准验证智能体</div>
+                  <div className="text-[11px] text-muted-foreground">Gov Standard Validator</div>
+                </div>
+              </div>
             </div>
           </SidebarHeader>
           <SidebarContent>
